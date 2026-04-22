@@ -170,6 +170,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-head", "--lr_head", type=float, default=1e-3)
     p.add_argument("--lr-backbone", "--lr_backbone", type=float, default=1e-4)
     p.add_argument("--weight-decay", "--weight_decay", type=float, default=1e-4)
+    p.add_argument("--label-smoothing", "--label_smoothing", type=float, default=0.05)
 
     p.add_argument(
         "--no-plots",
@@ -200,6 +201,7 @@ def parse_args() -> argparse.Namespace:
     args.lr_head = _hp("lr_head", float, args.lr_head)
     args.lr_backbone = _hp("lr_backbone", float, args.lr_backbone)
     args.weight_decay = _hp("weight_decay", float, args.weight_decay)
+    args.label_smoothing = _hp("label_smoothing", float, args.label_smoothing)
     args.metrics_s3_uri = _hp("metrics_s3_uri", str, args.metrics_s3_uri)
 
     if os.environ.get("SM_HP_NO_PLOTS"):
@@ -381,7 +383,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.max_epochs)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     best_val = -1.0
@@ -544,6 +546,7 @@ def main() -> None:
         "lr_backbone": args.lr_backbone,
         "lr_head": args.lr_head,
         "weight_decay": args.weight_decay,
+        "label_smoothing": args.label_smoothing,
         "seed": args.seed,
         "train_seconds": train_time,
         "test_top1_acc": test_acc,
@@ -588,6 +591,7 @@ def main() -> None:
         "lr_backbone": args.lr_backbone,
         "lr_head": args.lr_head,
         "weight_decay": args.weight_decay,
+        "label_smoothing": args.label_smoothing,
         "test_top1_acc": test_acc,
         "test_top3_acc": test_topk_acc,
         "test_loss": test_loss,
