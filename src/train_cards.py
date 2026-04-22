@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import copy
+import datetime
+import io
 import json
 import os
 import random
@@ -24,37 +27,160 @@ def _bool(s: str) -> bool:
     return str(s).lower() in ("1", "true", "yes", "y")
 
 
+def _no_plots_cli_value(s: str) -> bool:
+    sl = str(s).lower().strip()
+    if sl in ("0", "false", "no", "n", ""):
+        return False
+    return True
+
+
+def _extract_sm_context() -> dict:
+    ctx = {
+        "training_job_name": os.environ.get("TRAINING_JOB_NAME", ""),
+        "current_host": os.environ.get("SM_CURRENT_HOST", ""),
+        "hosts": os.environ.get("SM_HOSTS", ""),
+        "instance_type": os.environ.get("SM_CURRENT_INSTANCE_TYPE", ""),
+        "num_gpus": os.environ.get("SM_NUM_GPUS", ""),
+        "num_cpus": os.environ.get("SM_NUM_CPUS", ""),
+    }
+    raw = os.environ.get("SM_TRAINING_ENV")
+    if raw:
+        try:
+            env_obj = json.loads(raw)
+            ctx["training_job_name"] = ctx["training_job_name"] or env_obj.get("job_name", "")
+            ctx["current_host"] = ctx["current_host"] or env_obj.get("current_host", "")
+            if not ctx["hosts"] and "hosts" in env_obj:
+                ctx["hosts"] = env_obj["hosts"]
+            if not ctx["instance_type"] and "current_instance_type" in env_obj:
+                ctx["instance_type"] = env_obj["current_instance_type"]
+            if not ctx["num_gpus"] and "num_gpus" in env_obj:
+                ctx["num_gpus"] = env_obj["num_gpus"]
+            if not ctx["num_cpus"] and "num_cpus" in env_obj:
+                ctx["num_cpus"] = env_obj["num_cpus"]
+        except json.JSONDecodeError:
+            pass
+    return ctx
+
+
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    if not uri.startswith("s3://"):
+        raise ValueError(f"Expected s3:// URI, got: {uri}")
+    no_scheme = uri[5:]
+    if "/" not in no_scheme:
+        raise ValueError(f"S3 URI must include key path, got: {uri}")
+    bucket, key = no_scheme.split("/", 1)
+    if not bucket or not key:
+        raise ValueError(f"Invalid S3 URI, got: {uri}")
+    return bucket, key
+
+
+def _append_metrics_csv_to_s3(s3_uri: str, row: dict) -> None:
+    if not s3_uri:
+        return
+
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+    except Exception as e:
+        print(f"WARN could not import boto3/botocore for metrics CSV upload: {e}")
+        return
+
+    try:
+        bucket, key = _parse_s3_uri(s3_uri)
+    except ValueError as e:
+        print(f"WARN metrics CSV upload skipped: {e}")
+        return
+
+    s3 = boto3.client("s3")
+    existing_rows = []
+    fieldnames = list(row.keys())
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        body = obj["Body"].read().decode("utf-8")
+        reader = csv.DictReader(io.StringIO(body))
+        existing_rows = list(reader)
+        if reader.fieldnames:
+            merged = list(reader.fieldnames)
+            for fn in fieldnames:
+                if fn not in merged:
+                    merged.append(fn)
+            fieldnames = merged
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code not in ("NoSuchKey", "404"):
+            print(f"WARN failed to read existing metrics CSV {s3_uri}: {e}")
+            return
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in existing_rows:
+        writer.writerow({k: r.get(k, "") for k in fieldnames})
+    writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=buf.getvalue().encode("utf-8"), ContentType="text/csv")
+        print(f"wrote run-metrics CSV row to {s3_uri}")
+    except Exception as e:
+        print(f"WARN failed to upload metrics CSV to {s3_uri}: {e}")
+
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description="SageMaker passes hyperparameters as underscore flags (--batch_size) "
+    )
 
-
-    p.add_argument("--data-root", default=os.environ.get("SM_CHANNEL_TRAIN", ""))
+    p.add_argument("--data-root", "--data_root", default=os.environ.get("SM_CHANNEL_TRAIN", ""))
     p.add_argument(
         "--unpack-dir",
+        "--unpack_dir",
         default=os.environ.get("SM_CHANNEL_UNPACK", "/opt/ml/input/data/unpacked"),
         help="Where to unzip cards.zip when the channel contains a zip instead of ImageFolder tree.",
     )
-    p.add_argument("--train-dir", default="")
-    p.add_argument("--valid-dir", default="")
-    p.add_argument("--test-dir", default="")
+    p.add_argument("--train-dir", "--train_dir", default="")
+    p.add_argument("--valid-dir", "--valid_dir", default="")
+    p.add_argument("--test-dir", "--test_dir", default="")
 
-    p.add_argument("--model-dir", default=os.environ.get("SM_MODEL_DIR", str(Path("outputs") / "model")))
-    p.add_argument("--output-dir", default=os.environ.get("SM_OUTPUT_DATA_DIR", str(Path("outputs"))))
+    p.add_argument(
+        "--model-dir",
+        "--model_dir",
+        default=os.environ.get("SM_MODEL_DIR", str(Path("outputs") / "model")),
+    )
+    p.add_argument(
+        "--output-dir",
+        "--output_dir",
+        default=os.environ.get("SM_OUTPUT_DATA_DIR", str(Path("outputs"))),
+    )
+    p.add_argument(
+        "--metrics-s3-uri",
+        "--metrics_s3_uri",
+        default="",
+        help="s3://bucket/path.csv to append one row of run metrics per training job.",
+    )
 
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--img-size", type=int, default=224)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--img-size", "--img_size", type=int, default=224)
+    p.add_argument("--batch-size", "--batch_size", type=int, default=64)
+    p.add_argument("--num-workers", "--num_workers", type=int, default=2)
 
-    p.add_argument("--max-epochs", type=int, default=20)
+    p.add_argument("--max-epochs", "--max_epochs", type=int, default=20)
     p.add_argument("--patience", type=int, default=5)
-    p.add_argument("--min-delta", type=float, default=1e-4)
+    p.add_argument("--min-delta", "--min_delta", type=float, default=1e-4)
 
-    p.add_argument("--lr-head", type=float, default=1e-3)
-    p.add_argument("--lr-backbone", type=float, default=1e-4)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--lr-head", "--lr_head", type=float, default=1e-3)
+    p.add_argument("--lr-backbone", "--lr_backbone", type=float, default=1e-4)
+    p.add_argument("--weight-decay", "--weight_decay", type=float, default=1e-4)
 
-    p.add_argument("--no-plots", action="store_true", help="skip matplotlib figures (headless / CI)")
+    p.add_argument(
+        "--no-plots",
+        "--no_plots",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="VAL",
+        type=_no_plots_cli_value,
+        help="Skip matplotlib figures (headless).",
+    )
     args = p.parse_args()
 
 
@@ -74,6 +200,7 @@ def parse_args() -> argparse.Namespace:
     args.lr_head = _hp("lr_head", float, args.lr_head)
     args.lr_backbone = _hp("lr_backbone", float, args.lr_backbone)
     args.weight_decay = _hp("weight_decay", float, args.weight_decay)
+    args.metrics_s3_uri = _hp("metrics_s3_uri", str, args.metrics_s3_uri)
 
     if os.environ.get("SM_HP_NO_PLOTS"):
         args.no_plots = _bool(os.environ["SM_HP_NO_PLOTS"])
@@ -104,7 +231,6 @@ def _ensure_imagefolder_root(data_root: Path, unpack_dir: Path) -> Path:
     if zpath is None:
         raise SystemExit(
             f"Could not find train/valid/test under {data_root} and no .zip to unpack. "
-            f"Upload either the folder tree or a single cards.zip."
         )
 
     unpack_root = Path(unpack_dir)
@@ -140,7 +266,7 @@ def resolve_data_dirs(args: argparse.Namespace) -> tuple[Path, Path, Path]:
         return Path(args.train_dir), Path(args.valid_dir), Path(args.test_dir)
     root = Path(args.data_root)
     if not str(root):
-        raise SystemExit("Provide --data-root (folder containing train/ valid/ test/) or explicit --train-dir/--valid-dir/--test-dir.")
+        raise SystemExit("Provide --data-root")
     root = _ensure_imagefolder_root(root, Path(args.unpack_dir))
     return root / "train", root / "valid", root / "test"
 
@@ -314,16 +440,36 @@ def main() -> None:
     all_logits = torch.cat(all_logits)
     all_y = torch.cat(all_y)
     preds = all_logits.argmax(1)
+    test_loss = float(nn.CrossEntropyLoss()(all_logits, all_y).item())
+    topk = min(3, len(classes))
+    topk_hits = all_logits.topk(topk, dim=1).indices.eq(all_y.view(-1, 1)).any(dim=1)
+    test_topk_acc = float(topk_hits.float().mean().item())
     test_acc = float((preds == all_y).float().mean().item())
     print(f"test top-1 accuracy: {test_acc:.4f}")
+    print(f"test top-{topk} accuracy: {test_topk_acc:.4f}")
+    print(f"test loss: {test_loss:.4f}")
 
     print(f"METRIC test_top1_accuracy = {test_acc:.6f}")
+    print(f"METRIC test_top3_accuracy = {test_topk_acc:.6f}")
+    print(f"METRIC test_loss = {test_loss:.6f}")
     print(f"METRIC best_val_accuracy = {float(best_val):.6f}")
+    print(f"METRIC best_val_loss = {float(min(history['val_loss'])):.6f}")
+    print(f"METRIC final_train_loss = {float(history['train_loss'][-1]):.6f}")
+    print(f"METRIC final_train_accuracy = {float(history['train_acc'][-1]):.6f}")
+    print(f"METRIC final_val_loss = {float(history['val_loss'][-1]):.6f}")
+    print(f"METRIC final_val_accuracy = {float(history['val_acc'][-1]):.6f}")
+    print(f"METRIC train_seconds = {float(train_time):.3f}")
     print(f"METRIC epochs_ran = {float(epochs_ran)}")
 
     report = classification_report(
         all_y.numpy(), preds.numpy(), target_names=classes, digits=4, output_dict=True
     )
+    macro = report.get("macro avg", {})
+    weighted = report.get("weighted avg", {})
+    print(f"METRIC test_macro_f1 = {float(macro.get('f1-score', 0.0)):.6f}")
+    print(f"METRIC test_weighted_f1 = {float(weighted.get('f1-score', 0.0)):.6f}")
+    print(f"METRIC test_macro_precision = {float(macro.get('precision', 0.0)):.6f}")
+    print(f"METRIC test_macro_recall = {float(macro.get('recall', 0.0)):.6f}")
     with open(out_dir / "classification_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
@@ -378,16 +524,22 @@ def main() -> None:
     with open(model_dir / "classes.json", "w", encoding="utf-8") as f:
         json.dump(classes, f, indent=2)
 
+    best_epoch_1idx = int(np.argmax(history["val_acc"]) + 1)
+    sm_ctx = _extract_sm_context()
     meta = {
+        "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "model": "efficientnet_b0",
         "num_classes": len(classes),
         "img_size": args.img_size,
+        "dataset_sizes": {"train": len(train_ds), "valid": len(valid_ds), "test": len(test_ds)},
         "max_epochs": args.max_epochs,
         "epochs_ran": epochs_ran,
+        "best_epoch_1idx": best_epoch_1idx,
         "early_stopped": stopped_early,
         "patience": args.patience,
         "min_delta": args.min_delta,
-        "best_val_acc": best_val,
+        "best_val_acc": float(best_val),
+        "best_val_loss": float(min(history["val_loss"])),
         "batch_size": args.batch_size,
         "lr_backbone": args.lr_backbone,
         "lr_head": args.lr_head,
@@ -395,9 +547,24 @@ def main() -> None:
         "seed": args.seed,
         "train_seconds": train_time,
         "test_top1_acc": test_acc,
+        "test_top3_acc": test_topk_acc,
+        "test_loss": test_loss,
+        "test_macro_f1": float(macro.get("f1-score", 0.0)),
+        "test_weighted_f1": float(weighted.get("f1-score", 0.0)),
+        "test_macro_precision": float(macro.get("precision", 0.0)),
+        "test_macro_recall": float(macro.get("recall", 0.0)),
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "runtime_context": sm_ctx,
+        "metrics_s3_uri": args.metrics_s3_uri,
         "imagenet_mean": mean,
         "imagenet_std": std,
+        "history": history,
+        "final_metrics": {
+            "final_train_loss": float(history["train_loss"][-1]),
+            "final_train_accuracy": float(history["train_acc"][-1]),
+            "final_val_loss": float(history["val_loss"][-1]),
+            "final_val_accuracy": float(history["val_acc"][-1]),
+        },
         "train_dir": str(train_dir),
         "valid_dir": str(valid_dir),
         "test_dir": str(test_dir),
@@ -410,6 +577,40 @@ def main() -> None:
         tar.add(model_dir / "model.pt", arcname="model.pt")
         tar.add(model_dir / "classes.json", arcname="classes.json")
         tar.add(model_dir / "metadata.json", arcname="metadata.json")
+
+    run_metrics_row = {
+        "created_utc": meta["created_utc"],
+        "training_job_name": sm_ctx.get("training_job_name", ""),
+        "model": meta["model"],
+        "epochs_ran": epochs_ran,
+        "best_epoch_1idx": best_epoch_1idx,
+        "batch_size": args.batch_size,
+        "lr_backbone": args.lr_backbone,
+        "lr_head": args.lr_head,
+        "weight_decay": args.weight_decay,
+        "test_top1_acc": test_acc,
+        "test_top3_acc": test_topk_acc,
+        "test_loss": test_loss,
+        "best_val_acc": float(best_val),
+        "best_val_loss": float(min(history["val_loss"])),
+        "test_macro_f1": float(macro.get("f1-score", 0.0)),
+        "test_weighted_f1": float(weighted.get("f1-score", 0.0)),
+        "train_seconds": float(train_time),
+        "num_classes": len(classes),
+        "img_size": args.img_size,
+        "instance_type": sm_ctx.get("instance_type", ""),
+        "device": meta["device"],
+        "model_artifact_local": str(tar_path),
+    }
+    local_metrics_csv = out_dir / "run_metrics.csv"
+    with open(local_metrics_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(run_metrics_row.keys()))
+        writer.writeheader()
+        writer.writerow(run_metrics_row)
+    print(f"wrote {local_metrics_csv}")
+
+    if args.metrics_s3_uri:
+        _append_metrics_csv_to_s3(args.metrics_s3_uri, run_metrics_row)
 
     print(f"wrote {tar_path} ({tar_path.stat().st_size/1e6:.1f} MB)")
 
