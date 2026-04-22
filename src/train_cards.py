@@ -171,6 +171,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-backbone", "--lr_backbone", type=float, default=1e-4)
     p.add_argument("--weight-decay", "--weight_decay", type=float, default=1e-4)
     p.add_argument("--label-smoothing", "--label_smoothing", type=float, default=0.05)
+    p.add_argument("--rotation-degrees", "--rotation_degrees", type=float, default=10.0)
 
     p.add_argument(
         "--no-plots",
@@ -202,6 +203,7 @@ def parse_args() -> argparse.Namespace:
     args.lr_backbone = _hp("lr_backbone", float, args.lr_backbone)
     args.weight_decay = _hp("weight_decay", float, args.weight_decay)
     args.label_smoothing = _hp("label_smoothing", float, args.label_smoothing)
+    args.rotation_degrees = _hp("rotation_degrees", float, args.rotation_degrees)
     args.metrics_s3_uri = _hp("metrics_s3_uri", str, args.metrics_s3_uri)
 
     if os.environ.get("SM_HP_NO_PLOTS"):
@@ -280,7 +282,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def build_transforms(img_size: int):
+def build_transforms(img_size: int, rotation_degrees: float):
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
     train_tf = transforms.Compose(
@@ -289,7 +291,7 @@ def build_transforms(img_size: int):
             transforms.RandomCrop(img_size),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
-            transforms.RandomRotation(degrees=8),
+            transforms.RandomRotation(degrees=rotation_degrees),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
         ]
@@ -338,7 +340,7 @@ def main() -> None:
     train_dir, valid_dir, test_dir = resolve_data_dirs(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_tf, eval_tf, mean, std = build_transforms(args.img_size)
+    train_tf, eval_tf, mean, std = build_transforms(args.img_size, args.rotation_degrees)
 
     train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
     valid_ds = datasets.ImageFolder(str(valid_dir), transform=eval_tf)
@@ -547,6 +549,7 @@ def main() -> None:
         "lr_head": args.lr_head,
         "weight_decay": args.weight_decay,
         "label_smoothing": args.label_smoothing,
+        "rotation_degrees": args.rotation_degrees,
         "seed": args.seed,
         "train_seconds": train_time,
         "test_top1_acc": test_acc,
@@ -592,6 +595,7 @@ def main() -> None:
         "lr_head": args.lr_head,
         "weight_decay": args.weight_decay,
         "label_smoothing": args.label_smoothing,
+        "rotation_degrees": args.rotation_degrees,
         "test_top1_acc": test_acc,
         "test_top3_acc": test_topk_acc,
         "test_loss": test_loss,
