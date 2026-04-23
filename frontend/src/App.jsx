@@ -26,8 +26,8 @@ const ACTIVE_TRACK_WINDOW_MS = 1500;
 const STICKY_CONFIRMED_TRACKS = true;
 const STICKY_MAX_IDLE_MS = 12000;
 
-// Client-side OpenCV multi-card path (contours + tracking). Off while testing the new model, might change later.
-const ENABLE_OPENCV_MULTICARD = false;
+// Client-side OpenCV multi-card path (contours + tracking). Re-enabled after abandoning the YOLO pipeline.
+const ENABLE_OPENCV_MULTICARD = true;
 
 function App() {
   const [mode, setMode] = useState("upload");
@@ -39,6 +39,7 @@ function App() {
   const [isLiveScanning, setIsLiveScanning] = useState(false);
   const [scanIntervalMs, setScanIntervalMs] = useState(1200);
   const [detectConf, setDetectConf] = useState(0.1);
+  const [cropPadding, setCropPadding] = useState(4);
   const [multiCardMode, setMultiCardMode] = useState(ENABLE_OPENCV_MULTICARD);
   const [opencvReady, setOpencvReady] = useState(false);
   const [result, setResult] = useState(null);
@@ -191,7 +192,7 @@ function App() {
       setIsLoading(true);
     }
     try {
-      const data = await predictPipeline({ imageBase64, topK, detectConf });
+      const data = await predictPipeline({ imageBase64, topK, detectConf, cropPadding });
       setPipelineResult(data);
       setPipelineFrameSize(frameSize);
       setResult(null);
@@ -833,6 +834,22 @@ function App() {
                     value={detectConf}
                     onChange={(e) => setDetectConf(Number(e.target.value))}
                   />
+
+                  <label className="label">
+                    Crop padding around detection: {cropPadding.toFixed(1)}x
+                  </label>
+                  <input
+                    type="range"
+                    min={0}
+                    max={10}
+                    step={0.5}
+                    value={cropPadding}
+                    onChange={(e) => setCropPadding(Number(e.target.value))}
+                  />
+                  <p className="muted small">
+                    Detector boxes here are the card&apos;s corner index. Pad each detection by this factor of its size before
+                    classifying (e.g. 4x = the crop becomes ~9× the detected box). Increase if the classifier sees only corners.
+                  </p>
                 </>
               )}
 
