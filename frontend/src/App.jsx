@@ -2,6 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import NavBar from "./components/NavBar";
 import { predictCard, predictCards } from "./services/api";
 
+const LOCK_THRESHOLD = 0.9;
+const TRACK_TTL_MS = 1800;
+const DETECT_INTERVAL_MS = 120;
+
 function App() {
   const [mode, setMode] = useState("upload");
   const [file, setFile] = useState(null);
@@ -14,7 +18,6 @@ function App() {
   const [multiCardMode, setMultiCardMode] = useState(true);
   const [opencvReady, setOpencvReady] = useState(false);
   const [result, setResult] = useState(null);
-  const [detectedRects, setDetectedRects] = useState([]);
   const [liveCards, setLiveCards] = useState([]);
   const [error, setError] = useState("");
 
@@ -22,7 +25,10 @@ function App() {
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
   const scanTimerRef = useRef(null);
+  const detectTimerRef = useRef(null);
   const inFlightRef = useRef(false);
+  const tracksRef = useRef([]);
+  const nextTrackIdRef = useRef(1);
 
   const hasFile = useMemo(() => Boolean(file), [file]);
 
@@ -30,6 +36,9 @@ function App() {
     return () => {
       if (scanTimerRef.current) {
         clearInterval(scanTimerRef.current);
+      }
+      if (detectTimerRef.current) {
+        clearInterval(detectTimerRef.current);
       }
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop());
@@ -50,6 +59,13 @@ function App() {
     }, 400);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (mode !== "live" && isCameraOn) {
+      stopCamera();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
 
   const onFileChange = (event) => {
     const picked = event.target.files?.[0];
@@ -128,6 +144,12 @@ function App() {
     await runPrediction(imageBase64, "upload");
   };
 
+  const resetLiveTrackingState = () => {
+    tracksRef.current = [];
+    nextTrackIdRef.current = 1;
+    setLiveCards([]);
+  };
+
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -141,12 +163,17 @@ function App() {
       }
       setIsCameraOn(true);
       setError("");
+      if (mode === "live") {
+        startDetectionLoop();
+      }
     } catch (err) {
       setError(`Camera access failed: ${err.message}`);
     }
   };
 
   const stopCamera = () => {
+    stopLiveScan();
+    stopDetectionLoop();
     if (scanTimerRef.current) {
       clearInterval(scanTimerRef.current);
       scanTimerRef.current = null;
@@ -158,8 +185,7 @@ function App() {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
-    setLiveCards([]);
-    setDetectedRects([]);
+    resetLiveTrackingState();
     setIsLiveScanning(false);
     setIsCameraOn(false);
   };
@@ -248,6 +274,78 @@ function App() {
     }));
   };
 
+  const calcCenter = (box) => ({
+    x: box.nx + box.nw / 2,
+    y: box.ny + box.nh / 2,
+  });
+
+  const centerDistance = (a, b) => {
+    const c1 = calcCenter(a);
+    const c2 = calcCenter(b);
+    return Math.hypot(c1.x - c2.x, c1.y - c2.y);
+  };
+
+  const mergeDetectionsIntoTracks = (detections) => {
+    const now = Date.now();
+    const existing = tracksRef.current.map((t) => ({ ...t }));
+    const used = new Set();
+
+    for (const det of detections) {
+      let bestIdx = -1;
+      let bestDist = Infinity;
+      for (let i = 0; i < existing.length; i += 1) {
+        if (used.has(i)) continue;
+        const d = centerDistance(existing[i], det);
+        if (d < 0.2 && d < bestDist) {
+          bestDist = d;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx >= 0) {
+        existing[bestIdx] = {
+          ...existing[bestIdx],
+          ...det,
+          lastSeen: now,
+        };
+        used.add(bestIdx);
+      } else {
+        existing.push({
+          id: nextTrackIdRef.current++,
+          ...det,
+          label: "",
+          probability: 0,
+          locked: false,
+          endpoint: "",
+          lastSeen: now,
+        });
+      }
+    }
+
+    const filtered = existing.filter((t) => now - t.lastSeen <= TRACK_TTL_MS);
+    tracksRef.current = filtered;
+    setLiveCards(filtered);
+  };
+
+  const startDetectionLoop = () => {
+    if (detectTimerRef.current) {
+      clearInterval(detectTimerRef.current);
+    }
+    detectTimerRef.current = setInterval(() => {
+      if (!isCameraOn || mode !== "live" || !multiCardMode || !opencvReady) return;
+      const canvas = drawCurrentFrameToCanvas();
+      if (!canvas) return;
+      const rects = detectCardRects(canvas);
+      mergeDetectionsIntoTracks(rects);
+    }, DETECT_INTERVAL_MS);
+  };
+
+  const stopDetectionLoop = () => {
+    if (detectTimerRef.current) {
+      clearInterval(detectTimerRef.current);
+      detectTimerRef.current = null;
+    }
+  };
+
   const cropRectToBase64 = (canvas, rect) => {
     const crop = document.createElement("canvas");
     crop.width = rect.w;
@@ -268,37 +366,43 @@ function App() {
     }
     setIsLiveScanning(true);
     scanTimerRef.current = setInterval(async () => {
-      const canvas = drawCurrentFrameToCanvas();
-      if (!canvas) return;
-
       if (mode === "live" && multiCardMode && opencvReady) {
-        const rects = detectCardRects(canvas);
-        setDetectedRects(rects);
-        if (rects.length > 0) {
-          const crops = rects.map((rect) => cropRectToBase64(canvas, rect));
+        const now = Date.now();
+        const unresolved = tracksRef.current.filter((t) => now - t.lastSeen < 700 && !t.locked);
+        if (unresolved.length > 0) {
+          const canvas = drawCurrentFrameToCanvas();
+          if (!canvas) return;
+          const crops = unresolved.map((rect) => cropRectToBase64(canvas, rect));
           const data = await runBatchPrediction(crops);
-          const preds = data?.predictions ?? [];
-          const detections = rects.map((rect, idx) => {
-            const top = preds[idx]?.top_prediction;
-            return {
-              ...rect,
-              label: top?.label ?? "Unknown",
-              probability: top?.probability ?? 0,
-              endpoint: data?.endpoint ?? "",
-            };
-          });
-          setLiveCards(detections);
-          if (detections.length) {
-            setResult(null);
-            return;
+          if (data?.predictions) {
+            const endpoint = data.endpoint ?? "";
+            const updated = tracksRef.current.map((track) => {
+              const idx = unresolved.findIndex((u) => u.id === track.id);
+              if (idx < 0) return track;
+              const top = data.predictions[idx]?.top_prediction;
+              if (!top) return track;
+              const probability = top.probability ?? 0;
+              return {
+                ...track,
+                label: top.label ?? track.label,
+                probability,
+                locked: track.locked || probability >= LOCK_THRESHOLD,
+                endpoint,
+              };
+            });
+            tracksRef.current = updated;
+            setLiveCards(updated);
           }
         }
+        setResult(null);
+        return;
       }
 
+      const canvas = drawCurrentFrameToCanvas();
+      if (!canvas) return;
       const imageBase64 = canvas.toDataURL("image/jpeg", 0.9).split(",")[1] ?? "";
       if (!imageBase64) return;
-      setLiveCards([]);
-      setDetectedRects([]);
+      resetLiveTrackingState();
       await runPrediction(imageBase64, "live");
     }, Math.max(300, Number(scanIntervalMs) || 1200));
   };
@@ -308,8 +412,6 @@ function App() {
       clearInterval(scanTimerRef.current);
       scanTimerRef.current = null;
     }
-    setDetectedRects([]);
-    setLiveCards([]);
     setIsLiveScanning(false);
   };
 
@@ -383,7 +485,10 @@ function App() {
                 <input
                   type="checkbox"
                   checked={multiCardMode}
-                  onChange={(e) => setMultiCardMode(e.target.checked)}
+                  onChange={(e) => {
+                    setMultiCardMode(e.target.checked);
+                    resetLiveTrackingState();
+                  }}
                 />
                 Detect multiple cards per frame (OpenCV)
               </label>
@@ -427,10 +532,10 @@ function App() {
               <div className="liveContainer">
                 <video ref={videoRef} className="preview livePreview" autoPlay playsInline muted />
                 <canvas ref={canvasRef} className="hiddenCanvas" />
-                {liveCards.map((card, idx) => (
+                {liveCards.map((card) => (
                   <div
-                    key={`box-${idx}`}
-                    className="cardBox"
+                    key={`box-${card.id}`}
+                    className={card.locked ? "cardBox lockedCardBox" : "cardBox"}
                     style={{
                       left: `${card.nx * 100}%`,
                       top: `${card.ny * 100}%`,
@@ -439,23 +544,10 @@ function App() {
                     }}
                   >
                     <span className="cardLabel">
-                      {card.label} {(card.probability * 100).toFixed(0)}%
+                      {card.label ? `${card.label} ${(card.probability * 100).toFixed(0)}%` : "Scanning..."}
                     </span>
                   </div>
                 ))}
-                {liveCards.length === 0 &&
-                  detectedRects.map((rect, idx) => (
-                    <div
-                      key={`box-empty-${idx}`}
-                      className="cardBox"
-                      style={{
-                        left: `${rect.nx * 100}%`,
-                        top: `${rect.ny * 100}%`,
-                        width: `${rect.nw * 100}%`,
-                        height: `${rect.nh * 100}%`,
-                      }}
-                    />
-                  ))}
               </div>
             )}
           </article>
@@ -467,12 +559,14 @@ function App() {
             {!error && liveCards.length > 0 && (
               <div>
                 <p>
-                  <strong>Detected cards:</strong> {liveCards.length}
+                  <strong>Tracked cards:</strong> {liveCards.length}
                 </p>
                 <ul>
                   {liveCards.map((card, idx) => (
-                    <li key={`${card.label}-${idx}-${card.nx}`}>
-                      Card {idx + 1}: <strong>{card.label}</strong> ({(card.probability * 100).toFixed(2)}%)
+                    <li key={`${card.id}-${card.label || "scan"}`}>
+                      Card {idx + 1}: <strong>{card.label || "Scanning..."}</strong>
+                      {card.label ? ` (${(card.probability * 100).toFixed(2)}%)` : ""}
+                      {card.locked ? " [locked]" : ""}
                     </li>
                   ))}
                 </ul>
