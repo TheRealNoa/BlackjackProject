@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import NavBar from "./components/NavBar";
-import { predictCard, predictCards } from "./services/api";
+import { predictCard, predictCards, predictPipeline } from "./services/api";
+
+const USE_PIPELINE = Boolean((import.meta.env.VITE_PIPELINE_PATH ?? "").trim());
 
 const LOCK_THRESHOLD = 0.9;
 const TRACK_TTL_MS = 3500;
@@ -24,8 +26,7 @@ const ACTIVE_TRACK_WINDOW_MS = 1500;
 const STICKY_CONFIRMED_TRACKS = true;
 const STICKY_MAX_IDLE_MS = 12000;
 
-// Client-side OpenCV multi-card path (contours + tracking). Off by default while using server-side YOLO + orchestrator.
-// Set to true to re-enable without removing this code.
+// Client-side OpenCV multi-card path (contours + tracking). Off while testing the new model, might change later.
 const ENABLE_OPENCV_MULTICARD = false;
 
 function App() {
@@ -40,6 +41,7 @@ function App() {
   const [multiCardMode, setMultiCardMode] = useState(ENABLE_OPENCV_MULTICARD);
   const [opencvReady, setOpencvReady] = useState(false);
   const [result, setResult] = useState(null);
+  const [pipelineResult, setPipelineResult] = useState(null);
   const [liveCards, setLiveCards] = useState([]);
   const [error, setError] = useState("");
 
@@ -116,6 +118,7 @@ function App() {
     }
     setFile(picked);
     setResult(null);
+    setPipelineResult(null);
     setError("");
     setPreviewUrl(URL.createObjectURL(picked));
   };
@@ -173,6 +176,30 @@ function App() {
     }
   };
 
+  const runPipelinePrediction = async (imageBase64, source = "upload") => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    if (source === "upload") {
+      setIsLoading(true);
+    }
+    try {
+      const data = await predictPipeline({ imageBase64, topK });
+      setPipelineResult(data);
+      setResult(null);
+      setError("");
+      return data;
+    } catch (err) {
+      const message = err?.response?.data?.error || err.message || "Pipeline prediction failed.";
+      setError(message);
+      return null;
+    } finally {
+      if (source === "upload") {
+        setIsLoading(false);
+      }
+      inFlightRef.current = false;
+    }
+  };
+
   const onSubmit = async (event) => {
     event.preventDefault();
     if (!file) {
@@ -180,9 +207,14 @@ function App() {
       return;
     }
     setResult(null);
+    setPipelineResult(null);
     setError("");
     const imageBase64 = await toBase64(file);
-    await runPrediction(imageBase64, "upload");
+    if (USE_PIPELINE) {
+      await runPipelinePrediction(imageBase64, "upload");
+    } else {
+      await runPrediction(imageBase64, "upload");
+    }
   };
 
   const resetLiveTrackingState = () => {
@@ -227,6 +259,8 @@ function App() {
       videoRef.current.srcObject = null;
     }
     resetLiveTrackingState();
+    setResult(null);
+    setPipelineResult(null);
     setIsLiveScanning(false);
     setIsCameraOn(false);
   };
@@ -666,7 +700,11 @@ function App() {
       const imageBase64 = canvas.toDataURL("image/jpeg", 0.9).split(",")[1] ?? "";
       if (!imageBase64) return;
       resetLiveTrackingState();
-      await runPrediction(imageBase64, "live");
+      if (USE_PIPELINE) {
+        await runPipelinePrediction(imageBase64, "live");
+      } else {
+        await runPrediction(imageBase64, "live");
+      }
     }, Math.max(300, Number(scanIntervalMs) || 1200));
   };
 
@@ -685,9 +723,10 @@ function App() {
 
         <section className="panel">
           <h1>Blackjack Card Classifier</h1>
-          <p className="muted">
+            <p className="muted">
             Switch between upload and live camera mode. Frames are sent to API Gateway and scored by SageMaker.
-          </p>
+            {USE_PIPELINE && " Multi-card frames use the detect → classify pipeline when VITE_PIPELINE_PATH is set."}
+            </p>
           <div className="modeToggle">
             <button
               type="button"
@@ -822,7 +861,10 @@ function App() {
           <article className="panel">
             <h2>Predictions</h2>
             {error && <p className="error">{error}</p>}
-            {!error && !result && liveCards.length === 0 && <p className="muted">No prediction yet.</p>}
+            {!error &&
+              !result?.predictions?.[0] &&
+              !pipelineResult &&
+              liveCards.length === 0 && <p className="muted">No prediction yet.</p>}
             {!error && liveCards.length > 0 && (
               <div>
                 <p>
@@ -840,6 +882,62 @@ function App() {
                 {liveCards[0]?.endpoint && (
                   <p className="muted small">
                     Endpoint: <code>{liveCards[0].endpoint}</code>
+                  </p>
+                )}
+              </div>
+            )}
+            {!error && pipelineResult && (
+              <div>
+                {pipelineResult.message && <p className="muted">{pipelineResult.message}</p>}
+                {!pipelineResult.message &&
+                  !(pipelineResult.cards?.length > 0) &&
+                  (pipelineResult.detections?.length > 0) && (
+                    <p className="muted">
+                      {pipelineResult.detections.length} detection(s) returned but no crops were classified.
+                    </p>
+                  )}
+                {!pipelineResult.message &&
+                  !(pipelineResult.cards?.length > 0) &&
+                  !(pipelineResult.detections?.length > 0) && (
+                    <p className="muted">Pipeline returned no detections.</p>
+                  )}
+                {pipelineResult.cards?.length > 0 && (
+                  <ul>
+                    {pipelineResult.cards.map((card, idx) => {
+                      const top = card.classification?.top_prediction;
+                      return (
+                        <li key={`pipe-${idx}-${top?.label ?? "?"}`}>
+                          Card {idx + 1}
+                          {top?.label != null ? (
+                            <>
+                              : <strong>{top.label}</strong> (
+                              {((top.probability ?? 0) * 100).toFixed(2)}%)
+                            </>
+                          ) : (
+                            <span className="muted"> (no classification)</span>
+                          )}
+                          <span className="muted small">
+                            {" "}
+                            det {((card.detection_confidence ?? 0) * 100).toFixed(0)}%
+                          </span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+                {(pipelineResult.detector_endpoint || pipelineResult.classifier_endpoint) && (
+                  <p className="muted small">
+                    {pipelineResult.detector_endpoint && (
+                      <>
+                        Detector: <code>{pipelineResult.detector_endpoint}</code>
+                        <br />
+                      </>
+                    )}
+                    {pipelineResult.classifier_endpoint && (
+                      <>
+                        Classifier: <code>{pipelineResult.classifier_endpoint}</code>
+                      </>
+                    )}
                   </p>
                 )}
               </div>
