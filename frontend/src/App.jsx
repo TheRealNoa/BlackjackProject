@@ -29,6 +29,9 @@ function App() {
   const inFlightRef = useRef(false);
   const tracksRef = useRef([]);
   const nextTrackIdRef = useRef(1);
+  const modeRef = useRef(mode);
+  const multiCardModeRef = useRef(multiCardMode);
+  const opencvReadyRef = useRef(opencvReady);
 
   const hasFile = useMemo(() => Boolean(file), [file]);
 
@@ -59,6 +62,18 @@ function App() {
     }, 400);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  useEffect(() => {
+    multiCardModeRef.current = multiCardMode;
+  }, [multiCardMode]);
+
+  useEffect(() => {
+    opencvReadyRef.current = opencvReady;
+  }, [opencvReady]);
 
   useEffect(() => {
     if (mode !== "live" && isCameraOn) {
@@ -336,7 +351,7 @@ function App() {
       clearInterval(detectTimerRef.current);
     }
     detectTimerRef.current = setInterval(() => {
-      if (!isCameraOn || mode !== "live" || !multiCardMode || !opencvReady) return;
+      if (!streamRef.current || modeRef.current !== "live" || !multiCardModeRef.current || !opencvReadyRef.current) return;
       const canvas = drawCurrentFrameToCanvas();
       if (!canvas) return;
       const rects = detectCardRects(canvas);
