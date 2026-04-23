@@ -7,6 +7,8 @@ import os
 import boto3
 
 sagemaker_runtime = boto3.client("sagemaker-runtime")
+ssm = boto3.client("ssm")
+_cached_endpoint_name = None
 
 
 def _response(status_code: int, body: dict):
@@ -29,14 +31,30 @@ def _parse_event(event: dict) -> dict:
     return json.loads(body)
 
 
+def _active_endpoint_name() -> str:
+    global _cached_endpoint_name
+    if _cached_endpoint_name:
+        return _cached_endpoint_name
+
+    explicit = os.environ.get("SAGEMAKER_ENDPOINT", "").strip()
+    if explicit:
+        _cached_endpoint_name = explicit
+        return _cached_endpoint_name
+
+    param_name = os.environ.get("ACTIVE_ENDPOINT_PARAM", "/blackjack/active-endpoint")
+    value = ssm.get_parameter(Name=param_name)["Parameter"]["Value"].strip()
+    if not value:
+        raise RuntimeError(f"SSM parameter {param_name} is empty.")
+    _cached_endpoint_name = value
+    return _cached_endpoint_name
+
+
 def lambda_handler(event, _context):
     try:
         if event.get("httpMethod") == "OPTIONS":
             return _response(200, {"ok": True})
 
-        endpoint_name = os.environ.get("SAGEMAKER_ENDPOINT", "").strip()
-        if not endpoint_name:
-            return _response(500, {"error": "SAGEMAKER_ENDPOINT is not configured."})
+        endpoint_name = _active_endpoint_name()
 
         req = _parse_event(event)
         image_b64 = req.get("image_base64")
