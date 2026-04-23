@@ -368,7 +368,8 @@ function App() {
     scanTimerRef.current = setInterval(async () => {
       if (mode === "live" && multiCardMode && opencvReady) {
         const now = Date.now();
-        const unresolved = tracksRef.current.filter((t) => now - t.lastSeen < 700 && !t.locked);
+        const activeTracks = tracksRef.current.filter((t) => now - t.lastSeen < 700);
+        const unresolved = activeTracks.filter((t) => !t.locked);
         if (unresolved.length > 0) {
           const canvas = drawCurrentFrameToCanvas();
           if (!canvas) return;
@@ -394,8 +395,10 @@ function App() {
             setLiveCards(updated);
           }
         }
-        setResult(null);
-        return;
+        if (activeTracks.length > 0) {
+          setResult(null);
+          return;
+        }
       }
 
       const canvas = drawCurrentFrameToCanvas();
