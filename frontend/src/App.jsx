@@ -214,15 +214,21 @@ function App() {
     const src = cv.imread(canvas);
     const gray = new cv.Mat();
     const blur = new cv.Mat();
+    const mask = new cv.Mat();
     const edges = new cv.Mat();
+    const merged = new cv.Mat();
+    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
     const contours = new cv.MatVector();
     const hierarchy = new cv.Mat();
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
-    cv.Canny(blur, edges, 60, 160);
-    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    cv.GaussianBlur(gray, blur, new cv.Size(7, 7), 0, 0, cv.BORDER_DEFAULT);
+    cv.adaptiveThreshold(blur, mask, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 35, 7);
+    cv.Canny(blur, edges, 40, 120);
+    cv.bitwise_or(mask, edges, merged);
+    cv.morphologyEx(merged, merged, cv.MORPH_CLOSE, kernel);
+    cv.findContours(merged, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-    const minArea = canvas.width * canvas.height * 0.02;
+    const minArea = canvas.width * canvas.height * 0.008;
     const maxArea = canvas.width * canvas.height * 0.9;
     const candidates = [];
 
@@ -234,34 +240,33 @@ function App() {
         continue;
       }
 
-      const peri = cv.arcLength(cnt, true);
-      const approx = new cv.Mat();
-      cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
-      if (approx.rows === 4 && cv.isContourConvex(approx)) {
-        const rect = cv.boundingRect(approx);
-        const ratio = rect.width / rect.height;
-        if (ratio > 0.45 && ratio < 0.95) {
-          candidates.push({
-            x: rect.x,
-            y: rect.y,
-            w: rect.width,
-            h: rect.height,
-            area,
-          });
-        }
+      const rect = cv.boundingRect(cnt);
+      const ratio = rect.width / rect.height;
+      const extent = area / Math.max(rect.width * rect.height, 1);
+      if (ratio > 0.32 && ratio < 1.25 && extent > 0.45) {
+        candidates.push({
+          x: rect.x,
+          y: rect.y,
+          w: rect.width,
+          h: rect.height,
+          area,
+          extent,
+        });
       }
-      approx.delete();
       cnt.delete();
     }
 
     src.delete();
     gray.delete();
     blur.delete();
+    mask.delete();
     edges.delete();
+    merged.delete();
+    kernel.delete();
     contours.delete();
     hierarchy.delete();
 
-    candidates.sort((a, b) => b.area - a.area);
+    candidates.sort((a, b) => (b.area * b.extent) - (a.area * a.extent));
     return candidates.slice(0, 4).map((c) => ({
       x: c.x,
       y: c.y,
