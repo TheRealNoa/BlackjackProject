@@ -1,3 +1,6 @@
 data/
 cards.zip
+frontend/node_modules/
+frontend/dist/
+frontend/.env
 screenshots/

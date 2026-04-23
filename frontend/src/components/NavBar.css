@@ -1,0 +1,28 @@
+.nav {
+  align-items: center;
+  backdrop-filter: blur(8px);
+  background: rgba(7, 15, 35, 0.75);
+  border: 1px solid rgba(77, 132, 255, 0.28);
+  border-radius: 14px;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  padding: 12px 16px;
+}
+
+.nav-brand {
+  color: #e7f0ff;
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+}
+
+.nav-pill {
+  background: #1f3d86;
+  border: 1px solid #4d84ff;
+  border-radius: 999px;
+  color: #d7e7ff;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 6px 10px;
+}
