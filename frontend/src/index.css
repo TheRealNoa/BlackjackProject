@@ -94,6 +94,28 @@ button:disabled {
   opacity: 0.6;
 }
 
+.modeToggle {
+  display: flex;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.modeBtn {
+  background: #1a2d61;
+  border: 1px solid #35539e;
+}
+
+.activeMode {
+  background: #2f67ff;
+  border-color: #5f8cff;
+}
+
+.buttonRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .grid {
   display: grid;
   gap: 16px;
@@ -103,6 +125,16 @@ button:disabled {
 .preview {
   border-radius: 10px;
   max-width: 100%;
+}
+
+.livePreview {
+  background: #040b1d;
+  min-height: 220px;
+  width: 100%;
+}
+
+.hiddenCanvas {
+  display: none;
 }
 
 code {
