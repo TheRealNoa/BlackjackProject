@@ -1024,6 +1024,38 @@ function App() {
                   !(pipelineResult.detections?.length > 0) && (
                     <p className="muted">Pipeline returned no detections.</p>
                   )}
+                <details style={{ marginTop: "0.75rem" }}>
+                  <summary className="muted small" style={{ cursor: "pointer" }}>
+                    Debug: raw pipeline response
+                  </summary>
+                  <pre
+                    className="muted small"
+                    style={{
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      maxHeight: "260px",
+                      overflow: "auto",
+                      background: "rgba(255,255,255,0.04)",
+                      padding: "0.5rem",
+                      borderRadius: "6px",
+                    }}
+                  >
+                    {JSON.stringify(
+                      {
+                        detector_endpoint: pipelineResult.detector_endpoint,
+                        classifier_endpoint: pipelineResult.classifier_endpoint,
+                        detections_count: pipelineResult.detections?.length ?? 0,
+                        cards_count: pipelineResult.cards?.length ?? 0,
+                        detections: (pipelineResult.detections ?? []).slice(0, 8),
+                        message: pipelineResult.message,
+                        frame_size: pipelineFrameSize,
+                        detect_conf_sent: detectConf,
+                      },
+                      null,
+                      2
+                    )}
+                  </pre>
+                </details>
                 {pipelineResult.cards?.length > 0 && (
                   <ul>
                     {pipelineResult.cards.map((card, idx) => {
