@@ -659,7 +659,14 @@ function App() {
     }
     setIsLiveScanning(true);
     scanTimerRef.current = setInterval(async () => {
-      if (ENABLE_OPENCV_MULTICARD && mode === "live" && multiCardMode && opencvReady) {
+      // Server pipeline does detect+crop+classify; skip client OpenCV path when it is on.
+      if (
+        ENABLE_OPENCV_MULTICARD &&
+        !USE_PIPELINE &&
+        mode === "live" &&
+        multiCardMode &&
+        opencvReady
+      ) {
         const now = Date.now();
         const activeTracks = tracksRef.current.filter(
           (t) =>
@@ -732,6 +739,15 @@ function App() {
             <p className="muted">
             Switch between upload and live camera mode. Frames are sent to API Gateway and scored by SageMaker.
             {USE_PIPELINE && " Multi-card frames use the detect → classify pipeline when VITE_PIPELINE_PATH is set."}
+            </p>
+            <p className="muted small">
+              Build-time routes: classifier{" "}
+              <code>{import.meta.env.VITE_PREDICT_PATH ?? "/predict"}</code>
+              {" · "}
+              pipeline{" "}
+              <code>
+                {(import.meta.env.VITE_PIPELINE_PATH ?? "").trim() || "(empty — add to .env.production and rebuild)"}
+              </code>
             </p>
           <div className="modeToggle">
             <button
