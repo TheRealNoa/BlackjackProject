@@ -24,6 +24,10 @@ const ACTIVE_TRACK_WINDOW_MS = 1500;
 const STICKY_CONFIRMED_TRACKS = true;
 const STICKY_MAX_IDLE_MS = 12000;
 
+// Client-side OpenCV multi-card path (contours + tracking). Off by default while using server-side YOLO + orchestrator.
+// Set to true to re-enable without removing this code.
+const ENABLE_OPENCV_MULTICARD = false;
+
 function App() {
   const [mode, setMode] = useState("upload");
   const [file, setFile] = useState(null);
@@ -33,7 +37,7 @@ function App() {
   const [isCameraOn, setIsCameraOn] = useState(false);
   const [isLiveScanning, setIsLiveScanning] = useState(false);
   const [scanIntervalMs, setScanIntervalMs] = useState(1200);
-  const [multiCardMode, setMultiCardMode] = useState(true);
+  const [multiCardMode, setMultiCardMode] = useState(ENABLE_OPENCV_MULTICARD);
   const [opencvReady, setOpencvReady] = useState(false);
   const [result, setResult] = useState(null);
   const [liveCards, setLiveCards] = useState([]);
@@ -71,6 +75,10 @@ function App() {
   }, [previewUrl]);
 
   useEffect(() => {
+    if (!ENABLE_OPENCV_MULTICARD) {
+      setOpencvReady(false);
+      return undefined;
+    }
     const timer = setInterval(() => {
       const cv = window.cv;
       if (cv && typeof cv.Mat === "function") {
@@ -196,7 +204,7 @@ function App() {
       }
       setIsCameraOn(true);
       setError("");
-      if (mode === "live") {
+      if (mode === "live" && ENABLE_OPENCV_MULTICARD) {
         startDetectionLoop();
       }
     } catch (err) {
@@ -293,6 +301,7 @@ function App() {
   };
 
   const detectCardRects = (canvas) => {
+    if (!ENABLE_OPENCV_MULTICARD) return [];
     const cv = window.cv;
     if (!opencvReady || !cv || !canvas) return [];
 
@@ -524,11 +533,19 @@ function App() {
   };
 
   const startDetectionLoop = () => {
+    if (!ENABLE_OPENCV_MULTICARD) return;
     if (detectTimerRef.current) {
       clearInterval(detectTimerRef.current);
     }
     detectTimerRef.current = setInterval(() => {
-      if (!streamRef.current || modeRef.current !== "live" || !multiCardModeRef.current || !opencvReadyRef.current) return;
+      if (
+        !ENABLE_OPENCV_MULTICARD ||
+        !streamRef.current ||
+        modeRef.current !== "live" ||
+        !multiCardModeRef.current ||
+        !opencvReadyRef.current
+      )
+        return;
       const canvas = drawCurrentFrameToCanvas();
       if (!canvas) return;
       const rects = detectCardRects(canvas);
@@ -545,7 +562,7 @@ function App() {
 
   const cropRectToBase64 = (canvas, rect) => {
     const cv = window.cv;
-    if (opencvReady && cv && rect?.corners?.length === 4) {
+    if (ENABLE_OPENCV_MULTICARD && opencvReady && cv && rect?.corners?.length === 4) {
       const crop = document.createElement("canvas");
       crop.width = CARD_WARP_WIDTH;
       crop.height = CARD_WARP_HEIGHT;
@@ -602,7 +619,7 @@ function App() {
     }
     setIsLiveScanning(true);
     scanTimerRef.current = setInterval(async () => {
-      if (mode === "live" && multiCardMode && opencvReady) {
+      if (ENABLE_OPENCV_MULTICARD && mode === "live" && multiCardMode && opencvReady) {
         const now = Date.now();
         const activeTracks = tracksRef.current.filter(
           (t) =>
@@ -727,16 +744,18 @@ function App() {
                 value={scanIntervalMs}
                 onChange={(e) => setScanIntervalMs(Number(e.target.value || 1200))}
               />
-              <label className="checkRow">
+              <label className={`checkRow${!ENABLE_OPENCV_MULTICARD ? " muted" : ""}`}>
                 <input
                   type="checkbox"
                   checked={multiCardMode}
+                  disabled={!ENABLE_OPENCV_MULTICARD}
                   onChange={(e) => {
                     setMultiCardMode(e.target.checked);
                     resetLiveTrackingState();
                   }}
                 />
                 Detect multiple cards per frame (OpenCV)
+                {!ENABLE_OPENCV_MULTICARD && " — off (use server pipeline / YOLO). Enable in code: ENABLE_OPENCV_MULTICARD."}
               </label>
 
               <div className="buttonRow">
@@ -764,7 +783,9 @@ function App() {
               <p className="muted small">
                 Camera: {isCameraOn ? "On" : "Off"} | Live scan: {isLiveScanning ? "Running" : "Stopped"}
               </p>
-              <p className="muted small">OpenCV detector: {opencvReady ? "Ready" : "Loading..."}</p>
+              {ENABLE_OPENCV_MULTICARD && (
+                <p className="muted small">OpenCV detector: {opencvReady ? "Ready" : "Loading..."}</p>
+              )}
             </div>
           )}
         </section>
