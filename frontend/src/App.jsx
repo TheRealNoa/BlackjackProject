@@ -6,7 +6,11 @@ const USE_PIPELINE = Boolean((import.meta.env.VITE_PIPELINE_PATH ?? "").trim());
 
 const LOCK_THRESHOLD = 0.9;
 const TRACK_TTL_MS = 3500;
-const DETECT_INTERVAL_MS = 120;
+const DETECT_INTERVAL_MS = 250;
+const CAMERA_REQUEST_WIDTH = 960;
+const CAMERA_REQUEST_HEIGHT = 540;
+const CAMERA_REQUEST_FPS = 30;
+const PROCESS_MAX_WIDTH = 480;
 const CARD_WARP_WIDTH = 200;
 const CARD_WARP_HEIGHT = 300;
 const CARD_RATIO_MIN = 1.2;
@@ -296,7 +300,12 @@ function App() {
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" } },
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: CAMERA_REQUEST_WIDTH },
+          height: { ideal: CAMERA_REQUEST_HEIGHT },
+          frameRate: { ideal: CAMERA_REQUEST_FPS, max: CAMERA_REQUEST_FPS },
+        },
         audio: false,
       });
       streamRef.current = stream;
@@ -341,7 +350,7 @@ function App() {
     const canvas = canvasRef.current;
     if (!video || !canvas || !video.videoWidth || !video.videoHeight) return "";
 
-    const maxWidth = 640;
+    const maxWidth = PROCESS_MAX_WIDTH;
     const ratio = maxWidth / video.videoWidth;
     const outWidth = video.videoWidth > maxWidth ? maxWidth : video.videoWidth;
     const outHeight = video.videoWidth > maxWidth ? Math.round(video.videoHeight * ratio) : video.videoHeight;
@@ -634,7 +643,26 @@ function App() {
       return now - t.lastSeen <= TRACK_TTL_MS && (t.missCount ?? 0) <= MAX_MISSED_DETECTIONS;
     });
     tracksRef.current = filtered;
-    setLiveCards(filtered.filter((t) => t.stable || t.locked || t.sticky));
+    const visible = filtered.filter((t) => t.stable || t.locked || t.sticky);
+    setLiveCards((prev) => {
+      if (prev.length !== visible.length) return visible;
+      for (let i = 0; i < visible.length; i++) {
+        const a = prev[i];
+        const b = visible[i];
+        if (
+          a.id !== b.id ||
+          a.label !== b.label ||
+          a.locked !== b.locked ||
+          Math.abs((a.nx ?? 0) - b.nx) > 0.01 ||
+          Math.abs((a.ny ?? 0) - b.ny) > 0.01 ||
+          Math.abs((a.nw ?? 0) - b.nw) > 0.01 ||
+          Math.abs((a.nh ?? 0) - b.nh) > 0.01
+        ) {
+          return visible;
+        }
+      }
+      return prev;
+    });
   };
 
   const startDetectionLoop = () => {
