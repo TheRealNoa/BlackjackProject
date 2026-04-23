@@ -42,6 +42,7 @@ function App() {
   const [opencvReady, setOpencvReady] = useState(false);
   const [result, setResult] = useState(null);
   const [pipelineResult, setPipelineResult] = useState(null);
+  const [pipelineFrameSize, setPipelineFrameSize] = useState(null);
   const [liveCards, setLiveCards] = useState([]);
   const [error, setError] = useState("");
 
@@ -182,7 +183,7 @@ function App() {
     }
   };
 
-  const runPipelinePrediction = async (imageBase64, source = "upload") => {
+  const runPipelinePrediction = async (imageBase64, source = "upload", frameSize = null) => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
     if (source === "upload") {
@@ -191,6 +192,7 @@ function App() {
     try {
       const data = await predictPipeline({ imageBase64, topK });
       setPipelineResult(data);
+      setPipelineFrameSize(frameSize);
       setResult(null);
       setError("");
       return data;
@@ -214,10 +216,17 @@ function App() {
     }
     setResult(null);
     setPipelineResult(null);
+    setPipelineFrameSize(null);
     setError("");
     const imageBase64 = await toBase64(file);
     if (USE_PIPELINE) {
-      await runPipelinePrediction(imageBase64, "upload");
+      const img = new Image();
+      const size = await new Promise((resolve) => {
+        img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+        img.onerror = () => resolve(null);
+        img.src = `data:image/*;base64,${imageBase64}`;
+      });
+      await runPipelinePrediction(imageBase64, "upload", size);
     } else {
       await runPrediction(imageBase64, "upload");
     }
@@ -267,6 +276,7 @@ function App() {
     resetLiveTrackingState();
     setResult(null);
     setPipelineResult(null);
+    setPipelineFrameSize(null);
     setIsLiveScanning(false);
     setIsCameraOn(false);
   };
@@ -714,7 +724,10 @@ function App() {
       if (!imageBase64) return;
       resetLiveTrackingState();
       if (USE_PIPELINE) {
-        await runPipelinePrediction(imageBase64, "live");
+        await runPipelinePrediction(imageBase64, "live", {
+          w: canvas.width,
+          h: canvas.height,
+        });
       } else {
         await runPrediction(imageBase64, "live");
       }
@@ -893,6 +906,59 @@ function App() {
                     </span>
                   </div>
                 ))}
+                {pipelineFrameSize?.w > 0 &&
+                  pipelineFrameSize?.h > 0 &&
+                  (() => {
+                    const fw = pipelineFrameSize.w;
+                    const fh = pipelineFrameSize.h;
+                    const cards = pipelineResult?.cards ?? [];
+                    const dets = pipelineResult?.detections ?? [];
+                    const items = cards.length > 0
+                      ? cards.map((c, i) => ({
+                          xyxy: c.xyxy,
+                          label: c.classification?.top_prediction?.label,
+                          prob: c.classification?.top_prediction?.probability,
+                          detConf: c.detection_confidence,
+                          key: `pipe-card-${i}`,
+                        }))
+                      : dets.map((d, i) => ({
+                          xyxy: d.xyxy,
+                          label: d.label,
+                          prob: null,
+                          detConf: d.confidence,
+                          key: `pipe-det-${i}`,
+                        }));
+                    return items
+                      .filter((it) => Array.isArray(it.xyxy) && it.xyxy.length === 4)
+                      .map((it) => {
+                        const [x1, y1, x2, y2] = it.xyxy;
+                        const left = Math.max(0, x1) / fw;
+                        const top = Math.max(0, y1) / fh;
+                        const width = Math.max(1, x2 - x1) / fw;
+                        const height = Math.max(1, y2 - y1) / fh;
+                        const labelText = it.label
+                          ? `${it.label}${it.prob != null ? ` ${(it.prob * 100).toFixed(0)}%` : ""}${
+                              it.detConf != null ? ` (det ${(it.detConf * 100).toFixed(0)}%)` : ""
+                            }`
+                          : it.detConf != null
+                            ? `card ${(it.detConf * 100).toFixed(0)}%`
+                            : "card";
+                        return (
+                          <div
+                            key={it.key}
+                            className="cardBox lockedCardBox"
+                            style={{
+                              left: `${left * 100}%`,
+                              top: `${top * 100}%`,
+                              width: `${width * 100}%`,
+                              height: `${height * 100}%`,
+                            }}
+                          >
+                            <span className="cardLabel">{labelText}</span>
+                          </div>
+                        );
+                      });
+                  })()}
               </div>
             )}
           </article>
