@@ -38,6 +38,7 @@ function App() {
   const [isCameraOn, setIsCameraOn] = useState(false);
   const [isLiveScanning, setIsLiveScanning] = useState(false);
   const [scanIntervalMs, setScanIntervalMs] = useState(1200);
+  const [detectConf, setDetectConf] = useState(0.1);
   const [multiCardMode, setMultiCardMode] = useState(ENABLE_OPENCV_MULTICARD);
   const [opencvReady, setOpencvReady] = useState(false);
   const [result, setResult] = useState(null);
@@ -190,7 +191,7 @@ function App() {
       setIsLoading(true);
     }
     try {
-      const data = await predictPipeline({ imageBase64, topK });
+      const data = await predictPipeline({ imageBase64, topK, detectConf });
       setPipelineResult(data);
       setPipelineFrameSize(frameSize);
       setResult(null);
@@ -818,6 +819,23 @@ function App() {
                 value={scanIntervalMs}
                 onChange={(e) => setScanIntervalMs(Number(e.target.value || 1200))}
               />
+
+              {USE_PIPELINE && (
+                <>
+                  <label className="label">
+                    Detector confidence: {detectConf.toFixed(2)}
+                  </label>
+                  <input
+                    type="range"
+                    min={0.05}
+                    max={0.9}
+                    step={0.05}
+                    value={detectConf}
+                    onChange={(e) => setDetectConf(Number(e.target.value))}
+                  />
+                </>
+              )}
+
               <label className={`checkRow${!ENABLE_OPENCV_MULTICARD ? " muted" : ""}`}>
                 <input
                   type="checkbox"

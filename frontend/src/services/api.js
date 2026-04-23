@@ -32,7 +32,7 @@ export async function predictCards({ imagesBase64, topK = 1 }) {
 export async function predictPipeline({
   imageBase64,
   topK = 3,
-  detectConf = 0.25,
+  detectConf = 0.1,
   detectIou = 0.45,
   maxDetections = 12,
   cropPadding = 0.02,
