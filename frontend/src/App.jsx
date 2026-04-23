@@ -78,6 +78,12 @@ function App() {
 
   useEffect(() => {
     if (!ENABLE_OPENCV_MULTICARD) {
+      setMultiCardMode(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!ENABLE_OPENCV_MULTICARD) {
       setOpencvReady(false);
       return undefined;
     }
@@ -796,6 +802,23 @@ function App() {
                 Detect multiple cards per frame (OpenCV)
                 {!ENABLE_OPENCV_MULTICARD && " — off (use server pipeline / YOLO). Enable in code: ENABLE_OPENCV_MULTICARD."}
               </label>
+
+              {!USE_PIPELINE && (
+                <p className="muted small" style={{ marginTop: "0.75rem", maxWidth: "42rem" }}>
+                  <strong>Note:</strong> Without <code>VITE_PIPELINE_PATH</code>, live mode sends the{" "}
+                  <em>entire</em> camera frame to the classifier. The model was trained on{" "}
+                  <em>tight card crops</em>, so distant table shots often look like random suits (e.g. J♠ vs J♣) with
+                  low confidence. Fix: add <code>VITE_PIPELINE_PATH=/predict-pipeline</code> in{" "}
+                  <code>frontend/.env</code> (YOLO crop → classify), or zoom so the card fills most of the frame, or
+                  use <strong>Upload</strong> with a close-up photo.
+                </p>
+              )}
+              {USE_PIPELINE && (
+                <p className="muted small" style={{ marginTop: "0.75rem" }}>
+                  Pipeline mode: each frame is sent to <code>/predict-pipeline</code> (detect boxes, then classify each
+                  crop).
+                </p>
+              )}
 
               <div className="buttonRow">
                 {!isCameraOn ? (
