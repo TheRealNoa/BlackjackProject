@@ -8,7 +8,6 @@ import boto3
 
 sagemaker_runtime = boto3.client("sagemaker-runtime")
 ssm = boto3.client("ssm")
-_cached_endpoint_name = None
 
 
 def _response(status_code: int, body: dict):
@@ -32,21 +31,15 @@ def _parse_event(event: dict) -> dict:
 
 
 def _active_endpoint_name() -> str:
-    global _cached_endpoint_name
-    if _cached_endpoint_name:
-        return _cached_endpoint_name
-
     explicit = os.environ.get("SAGEMAKER_ENDPOINT", "").strip()
     if explicit:
-        _cached_endpoint_name = explicit
-        return _cached_endpoint_name
+        return explicit
 
     param_name = os.environ.get("ACTIVE_ENDPOINT_PARAM", "/blackjack/active-endpoint")
     value = ssm.get_parameter(Name=param_name)["Parameter"]["Value"].strip()
     if not value:
         raise RuntimeError(f"SSM parameter {param_name} is empty.")
-    _cached_endpoint_name = value
-    return _cached_endpoint_name
+    return value
 
 
 def lambda_handler(event, _context):
