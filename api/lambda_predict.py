@@ -27,6 +27,8 @@ def _parse_event(event: dict) -> dict:
     body = event.get("body", "{}")
     if event.get("isBase64Encoded"):
         body = base64.b64decode(body).decode("utf-8")
+    if isinstance(body, dict):
+        return body
     return json.loads(body)
 
 
@@ -50,18 +52,19 @@ def lambda_handler(event, _context):
         endpoint_name = _active_endpoint_name()
 
         req = _parse_event(event)
-        image_b64 = req.get("image_base64")
-        if not image_b64:
-            return _response(400, {"error": "image_base64 is required"})
+        top_k = int(req.get("top_k", 3))
+        if "images_base64" in req:
+            images = req.get("images_base64") or []
+            if not isinstance(images, list) or len(images) == 0:
+                return _response(400, {"error": "images_base64 must be a non-empty list"})
+            instances = [{"image_b64": image_b64, "top_k": top_k} for image_b64 in images]
+        else:
+            image_b64 = req.get("image_base64")
+            if not image_b64:
+                return _response(400, {"error": "image_base64 is required"})
+            instances = [{"image_b64": image_b64, "top_k": top_k}]
 
-        payload = {
-            "instances": [
-                {
-                    "image_b64": image_b64,
-                    "top_k": int(req.get("top_k", 3)),
-                }
-            ]
-        }
+        payload = {"instances": instances}
 
         sm_resp = sagemaker_runtime.invoke_endpoint(
             EndpointName=endpoint_name,

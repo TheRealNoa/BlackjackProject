@@ -139,6 +139,28 @@ button:disabled {
   width: 100%;
 }
 
+.liveContainer {
+  position: relative;
+}
+
+.cardBox {
+  border: 2px solid #57f287;
+  border-radius: 8px;
+  position: absolute;
+}
+
+.cardLabel {
+  background: rgba(7, 28, 16, 0.88);
+  border-radius: 6px;
+  color: #8dffc2;
+  font-size: 0.76rem;
+  left: 0;
+  padding: 2px 6px;
+  position: absolute;
+  top: -24px;
+  white-space: nowrap;
+}
+
 .hiddenCanvas {
   display: none;
 }

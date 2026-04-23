@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import NavBar from "./components/NavBar";
-import { predictCard } from "./services/api";
+import { predictCard, predictCards } from "./services/api";
 
 function App() {
   const [mode, setMode] = useState("upload");
@@ -14,6 +14,7 @@ function App() {
   const [multiCardMode, setMultiCardMode] = useState(true);
   const [opencvReady, setOpencvReady] = useState(false);
   const [result, setResult] = useState(null);
+  const [detectedRects, setDetectedRects] = useState([]);
   const [liveCards, setLiveCards] = useState([]);
   const [error, setError] = useState("");
 
@@ -99,6 +100,22 @@ function App() {
     }
   };
 
+  const runBatchPrediction = async (imagesBase64) => {
+    if (inFlightRef.current) return null;
+    inFlightRef.current = true;
+    try {
+      const data = await predictCards({ imagesBase64, topK: 1 });
+      setError("");
+      return data;
+    } catch (err) {
+      const message = err?.response?.data?.error || err.message || "Prediction failed.";
+      setError(message);
+      return null;
+    } finally {
+      inFlightRef.current = false;
+    }
+  };
+
   const onSubmit = async (event) => {
     event.preventDefault();
     if (!file) {
@@ -142,6 +159,7 @@ function App() {
       videoRef.current.srcObject = null;
     }
     setLiveCards([]);
+    setDetectedRects([]);
     setIsLiveScanning(false);
     setIsCameraOn(false);
   };
@@ -161,13 +179,6 @@ function App() {
     const ctx = canvas.getContext("2d");
     ctx.drawImage(video, 0, 0, outWidth, outHeight);
     return canvas;
-  };
-
-  const captureFrameBase64 = () => {
-    const canvas = drawCurrentFrameToCanvas();
-    if (!canvas) return "";
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-    return dataUrl.split(",")[1] ?? "";
   };
 
   const detectCardRects = (canvas) => {
@@ -225,7 +236,16 @@ function App() {
     hierarchy.delete();
 
     candidates.sort((a, b) => b.area - a.area);
-    return candidates.slice(0, 4);
+    return candidates.slice(0, 4).map((c) => ({
+      x: c.x,
+      y: c.y,
+      w: c.w,
+      h: c.h,
+      nx: c.x / canvas.width,
+      ny: c.y / canvas.height,
+      nw: c.w / canvas.width,
+      nh: c.h / canvas.height,
+    }));
   };
 
   const cropRectToBase64 = (canvas, rect) => {
@@ -253,22 +273,22 @@ function App() {
 
       if (mode === "live" && multiCardMode && opencvReady) {
         const rects = detectCardRects(canvas);
+        setDetectedRects(rects);
         if (rects.length > 0) {
-          const detections = [];
-          for (const rect of rects) {
-            const imageBase64 = cropRectToBase64(canvas, rect);
-            const data = await runPrediction(imageBase64, "live", false);
-            const top = data?.predictions?.[0]?.top_prediction;
-            if (top) {
-              detections.push({
-                label: top.label,
-                probability: top.probability,
-                endpoint: data?.endpoint ?? "",
-              });
-            }
-          }
-          if (detections.length > 0) {
-            setLiveCards(detections);
+          const crops = rects.map((rect) => cropRectToBase64(canvas, rect));
+          const data = await runBatchPrediction(crops);
+          const preds = data?.predictions ?? [];
+          const detections = rects.map((rect, idx) => {
+            const top = preds[idx]?.top_prediction;
+            return {
+              ...rect,
+              label: top?.label ?? "Unknown",
+              probability: top?.probability ?? 0,
+              endpoint: data?.endpoint ?? "",
+            };
+          });
+          setLiveCards(detections);
+          if (detections.length) {
             setResult(null);
             return;
           }
@@ -278,6 +298,7 @@ function App() {
       const imageBase64 = canvas.toDataURL("image/jpeg", 0.9).split(",")[1] ?? "";
       if (!imageBase64) return;
       setLiveCards([]);
+      setDetectedRects([]);
       await runPrediction(imageBase64, "live");
     }, Math.max(300, Number(scanIntervalMs) || 1200));
   };
@@ -287,6 +308,8 @@ function App() {
       clearInterval(scanTimerRef.current);
       scanTimerRef.current = null;
     }
+    setDetectedRects([]);
+    setLiveCards([]);
     setIsLiveScanning(false);
   };
 
@@ -401,9 +424,38 @@ function App() {
             {mode === "upload" && !previewUrl && <p className="muted">No image selected.</p>}
             {mode === "upload" && previewUrl && <img className="preview" src={previewUrl} alt="Uploaded card preview" />}
             {mode === "live" && (
-              <div>
+              <div className="liveContainer">
                 <video ref={videoRef} className="preview livePreview" autoPlay playsInline muted />
                 <canvas ref={canvasRef} className="hiddenCanvas" />
+                {liveCards.map((card, idx) => (
+                  <div
+                    key={`box-${idx}`}
+                    className="cardBox"
+                    style={{
+                      left: `${card.nx * 100}%`,
+                      top: `${card.ny * 100}%`,
+                      width: `${card.nw * 100}%`,
+                      height: `${card.nh * 100}%`,
+                    }}
+                  >
+                    <span className="cardLabel">
+                      {card.label} {(card.probability * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                ))}
+                {liveCards.length === 0 &&
+                  detectedRects.map((rect, idx) => (
+                    <div
+                      key={`box-empty-${idx}`}
+                      className="cardBox"
+                      style={{
+                        left: `${rect.nx * 100}%`,
+                        top: `${rect.ny * 100}%`,
+                        width: `${rect.nw * 100}%`,
+                        height: `${rect.nh * 100}%`,
+                      }}
+                    />
+                  ))}
               </div>
             )}
           </article>
@@ -419,8 +471,8 @@ function App() {
                 </p>
                 <ul>
                   {liveCards.map((card, idx) => (
-                    <li key={`${card.label}-${idx}`}>
-                      {card.label}: {(card.probability * 100).toFixed(2)}%
+                    <li key={`${card.label}-${idx}-${card.nx}`}>
+                      Card {idx + 1}: <strong>{card.label}</strong> ({(card.probability * 100).toFixed(2)}%)
                     </li>
                   ))}
                 </ul>
@@ -437,13 +489,6 @@ function App() {
                   <strong>Top:</strong> {result.predictions[0].top_prediction.label} (
                   {(result.predictions[0].top_prediction.probability * 100).toFixed(2)}%)
                 </p>
-                <ul>
-                  {result.predictions[0].top_k.map((item) => (
-                    <li key={`${item.class_index}-${item.label}`}>
-                      {item.label}: {(item.probability * 100).toFixed(2)}%
-                    </li>
-                  ))}
-                </ul>
                 {result.endpoint && (
                   <p className="muted small">
                     Endpoint: <code>{result.endpoint}</code>

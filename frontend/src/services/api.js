@@ -18,3 +18,12 @@ export async function predictCard({ imageBase64, topK = 3 }) {
   const res = await api.post(predictPath, payload);
   return res.data;
 }
+
+export async function predictCards({ imagesBase64, topK = 1 }) {
+  const payload = {
+    images_base64: imagesBase64,
+    top_k: topK,
+  };
+  const res = await api.post(predictPath, payload);
+  return res.data;
+}
