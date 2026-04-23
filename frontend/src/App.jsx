@@ -29,6 +29,59 @@ const STICKY_MAX_IDLE_MS = 12000;
 // Client-side OpenCV multi-card path (contours + tracking). Re-enabled after abandoning the YOLO pipeline.
 const ENABLE_OPENCV_MULTICARD = true;
 
+const RANK_VALUES = {
+  ace: 11,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  jack: 10,
+  queen: 10,
+  king: 10,
+};
+
+const parseCardLabel = (label) => {
+  if (!label) return null;
+  const m = String(label).toLowerCase().match(/^([a-z]+)\s+of\s+([a-z]+)s?$/);
+  if (!m) return null;
+  const rank = m[1];
+  if (!(rank in RANK_VALUES)) return null;
+  return { rank, suit: m[2] };
+};
+
+const handTotal = (cards) => {
+  let total = 0;
+  let aces = 0;
+  for (const c of cards) {
+    const parsed = parseCardLabel(c.label);
+    if (!parsed) continue;
+    total += RANK_VALUES[parsed.rank];
+    if (parsed.rank === "ace") aces += 1;
+  }
+  while (total > 21 && aces > 0) {
+    total -= 10;
+    aces -= 1;
+  }
+  return total;
+};
+
+const handSummary = (cards) => {
+  const classified = cards.filter((c) => parseCardLabel(c.label));
+  const total = handTotal(classified);
+  if (classified.length === 0) {
+    return { total: 0, status: "empty" };
+  }
+  if (total > 21) return { total, status: "bust" };
+  if (total === 21 && classified.length === 2) return { total, status: "blackjack" };
+  if (total === 21) return { total, status: "twenty-one" };
+  return { total, status: "ok" };
+};
+
 function App() {
   const [mode, setMode] = useState("upload");
   const [file, setFile] = useState(null);
@@ -925,6 +978,9 @@ function App() {
               <div className="liveContainer">
                 <video ref={videoRef} className="preview livePreview" autoPlay playsInline muted />
                 <canvas ref={canvasRef} className="hiddenCanvas" />
+                <div className="tableDivider" />
+                <span className="tableZoneLabel dealer">Dealer</span>
+                <span className="tableZoneLabel player">Player</span>
                 {liveCards.map((card) => (
                   <div
                     key={`box-${card.id}`}
@@ -1005,27 +1061,58 @@ function App() {
               !result?.predictions?.[0] &&
               !pipelineResult &&
               liveCards.length === 0 && <p className="muted">No prediction yet.</p>}
-            {!error && liveCards.length > 0 && (
-              <div>
-                <p>
-                  <strong>Tracked cards:</strong> {liveCards.length}
-                </p>
-                <ul>
-                  {liveCards.map((card, idx) => (
-                    <li key={`${card.id}-${card.label || "scan"}`}>
-                      Card {idx + 1}: <strong>{card.label || "Scanning..."}</strong>
-                      {card.label ? ` (${(card.probability * 100).toFixed(2)}%)` : ""}
-                      {card.locked ? " [locked]" : ""}
-                    </li>
-                  ))}
-                </ul>
-                {liveCards[0]?.endpoint && (
-                  <p className="muted small">
-                    Endpoint: <code>{liveCards[0].endpoint}</code>
-                  </p>
-                )}
-              </div>
-            )}
+            {!error && liveCards.length > 0 && (() => {
+              const dealerCards = [];
+              const playerCards = [];
+              for (const card of liveCards) {
+                const centerY = (card.ny ?? 0) + (card.nh ?? 0) / 2;
+                (centerY < 0.5 ? dealerCards : playerCards).push(card);
+              }
+              const renderHand = (title, hand) => {
+                const summary = handSummary(hand);
+                return (
+                  <div className="handBlock" key={title}>
+                    <h3>
+                      {title}{" "}
+                      {summary.status !== "empty" && (
+                        <span className="handTotal">— {summary.total}</span>
+                      )}
+                      {summary.status === "bust" && <span className="muted small"> bust</span>}
+                      {summary.status === "blackjack" && (
+                        <span className="muted small"> blackjack!</span>
+                      )}
+                      {summary.status === "twenty-one" && (
+                        <span className="muted small"> 21</span>
+                      )}
+                    </h3>
+                    {hand.length === 0 ? (
+                      <p className="muted small">No cards.</p>
+                    ) : (
+                      <ul>
+                        {hand.map((card, idx) => (
+                          <li key={`${card.id}-${card.label || "scan"}`}>
+                            Card {idx + 1}: <strong>{card.label || "Scanning..."}</strong>
+                            {card.label ? ` (${(card.probability * 100).toFixed(0)}%)` : ""}
+                            {card.locked ? " [locked]" : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                );
+              };
+              return (
+                <div>
+                  {renderHand("Dealer's cards", dealerCards)}
+                  {renderHand("Player's cards", playerCards)}
+                  {liveCards[0]?.endpoint && (
+                    <p className="muted small">
+                      Endpoint: <code>{liveCards[0].endpoint}</code>
+                    </p>
+                  )}
+                </div>
+              );
+            })()}
             {!error && pipelineResult && (
               <div>
                 {pipelineResult.message && <p className="muted">{pipelineResult.message}</p>}

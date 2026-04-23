@@ -169,6 +169,50 @@ button:disabled {
   display: none;
 }
 
+.tableDivider {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 0;
+  border-top: 2px dashed rgba(255, 255, 255, 0.55);
+  pointer-events: none;
+}
+
+.tableZoneLabel {
+  position: absolute;
+  left: 8px;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #cbd5f5;
+  background: rgba(15, 30, 69, 0.75);
+  padding: 2px 8px;
+  border-radius: 6px;
+  pointer-events: none;
+}
+
+.tableZoneLabel.dealer {
+  top: 8px;
+}
+
+.tableZoneLabel.player {
+  bottom: 8px;
+}
+
+.handBlock {
+  margin-bottom: 0.75rem;
+}
+
+.handBlock h3 {
+  margin: 0 0 0.25rem 0;
+}
+
+.handTotal {
+  color: #8dffc2;
+  font-weight: 600;
+}
+
 code {
   background: #0f1e45;
   border-radius: 6px;
