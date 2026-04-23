@@ -3,8 +3,26 @@ import NavBar from "./components/NavBar";
 import { predictCard, predictCards } from "./services/api";
 
 const LOCK_THRESHOLD = 0.9;
-const TRACK_TTL_MS = 1800;
+const TRACK_TTL_MS = 3500;
 const DETECT_INTERVAL_MS = 120;
+const CARD_WARP_WIDTH = 200;
+const CARD_WARP_HEIGHT = 300;
+const CARD_RATIO_MIN = 1.2;
+const CARD_RATIO_MAX = 2.0;
+const CARD_MIN_EXTENT = 0.65;
+const CARD_MIN_AREA_FRAC = 0.003;
+const CARD_MAX_AREA_FRAC = 0.55;
+const CANNY_LOW = 30;
+const CANNY_HIGH = 100;
+const NMS_IOU_THRESHOLD = 0.4;
+const TRACK_IOU_MATCH = 0.25;
+const TRACK_CENTER_MATCH = 0.16;
+const TRACK_SMOOTHING_ALPHA = 0.35;
+const MIN_STABLE_HITS = 2;
+const MAX_MISSED_DETECTIONS = 10;
+const ACTIVE_TRACK_WINDOW_MS = 1500;
+const STICKY_CONFIRMED_TRACKS = true;
+const STICKY_MAX_IDLE_MS = 12000;
 
 function App() {
   const [mode, setMode] = useState("upload");
@@ -222,6 +240,58 @@ function App() {
     return canvas;
   };
 
+  const rectIoU = (a, b) => {
+    const ax2 = a.x + a.w;
+    const ay2 = a.y + a.h;
+    const bx2 = b.x + b.w;
+    const by2 = b.y + b.h;
+    const interW = Math.max(0, Math.min(ax2, bx2) - Math.max(a.x, b.x));
+    const interH = Math.max(0, Math.min(ay2, by2) - Math.max(a.y, b.y));
+    const inter = interW * interH;
+    if (inter <= 0) return 0;
+    const union = a.w * a.h + b.w * b.h - inter;
+    return union > 0 ? inter / union : 0;
+  };
+
+  const rectCenterDistance = (a, b) => {
+    const acx = a.x + a.w / 2;
+    const acy = a.y + a.h / 2;
+    const bcx = b.x + b.w / 2;
+    const bcy = b.y + b.h / 2;
+    return Math.hypot(acx - bcx, acy - bcy);
+  };
+
+  const orderQuadCorners = (pts) => {
+    if (!pts || pts.length !== 4) return null;
+    const sum = pts.map((p) => p.x + p.y);
+    const diff = pts.map((p) => p.y - p.x);
+    const tl = pts[sum.indexOf(Math.min(...sum))];
+    const br = pts[sum.indexOf(Math.max(...sum))];
+    const tr = pts[diff.indexOf(Math.min(...diff))];
+    const bl = pts[diff.indexOf(Math.max(...diff))];
+    if (!tl || !tr || !bl || !br) return null;
+    const topEdge = Math.hypot(tr.x - tl.x, tr.y - tl.y);
+    const leftEdge = Math.hypot(bl.x - tl.x, bl.y - tl.y);
+    if (topEdge > leftEdge) {
+      return [tr, tl, bl, br];
+    }
+    return [tl, bl, br, tr];
+  };
+
+  const rotatedRectCorners = (cv, rotatedRect) => {
+    const boxPts = new cv.Mat();
+    cv.boxPoints(rotatedRect, boxPts);
+    const pts = [];
+    for (let i = 0; i < 4; i += 1) {
+      pts.push({
+        x: boxPts.data32F[i * 2],
+        y: boxPts.data32F[i * 2 + 1],
+      });
+    }
+    boxPts.delete();
+    return pts;
+  };
+
   const detectCardRects = (canvas) => {
     const cv = window.cv;
     if (!opencvReady || !cv || !canvas) return [];
@@ -229,22 +299,36 @@ function App() {
     const src = cv.imread(canvas);
     const gray = new cv.Mat();
     const blur = new cv.Mat();
-    const mask = new cv.Mat();
     const edges = new cv.Mat();
-    const merged = new cv.Mat();
-    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
+    const adaptive = new cv.Mat();
+    const mask = new cv.Mat();
+    const closed = new cv.Mat();
+    const closeKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7));
+    const openKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
     const contours = new cv.MatVector();
     const hierarchy = new cv.Mat();
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-    cv.GaussianBlur(gray, blur, new cv.Size(7, 7), 0, 0, cv.BORDER_DEFAULT);
-    cv.adaptiveThreshold(blur, mask, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 35, 7);
-    cv.Canny(blur, edges, 40, 120);
-    cv.bitwise_or(mask, edges, merged);
-    cv.morphologyEx(merged, merged, cv.MORPH_CLOSE, kernel);
-    cv.findContours(merged, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-    const minArea = canvas.width * canvas.height * 0.008;
-    const maxArea = canvas.width * canvas.height * 0.9;
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+
+    cv.Canny(blur, edges, CANNY_LOW, CANNY_HIGH);
+    cv.adaptiveThreshold(
+      blur,
+      adaptive,
+      255,
+      cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+      cv.THRESH_BINARY_INV,
+      25,
+      8
+    );
+    cv.bitwise_or(edges, adaptive, mask);
+    cv.morphologyEx(mask, closed, cv.MORPH_CLOSE, closeKernel);
+    cv.morphologyEx(closed, closed, cv.MORPH_OPEN, openKernel);
+    cv.findContours(closed, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
+
+    const frameArea = canvas.width * canvas.height;
+    const minArea = frameArea * CARD_MIN_AREA_FRAC;
+    const maxArea = frameArea * CARD_MAX_AREA_FRAC;
     const candidates = [];
 
     for (let i = 0; i < contours.size(); i += 1) {
@@ -255,38 +339,99 @@ function App() {
         continue;
       }
 
-      const rect = cv.boundingRect(cnt);
-      const ratio = rect.width / rect.height;
-      const extent = area / Math.max(rect.width * rect.height, 1);
-      if (ratio > 0.32 && ratio < 1.25 && extent > 0.45) {
-        candidates.push({
-          x: rect.x,
-          y: rect.y,
-          w: rect.width,
-          h: rect.height,
-          area,
-          extent,
-        });
+      const peri = cv.arcLength(cnt, true);
+      const approx = new cv.Mat();
+      cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+
+      let quadCorners = null;
+      let quadArea = 0;
+      if (approx.rows === 4 && cv.isContourConvex(approx)) {
+        const quadPts = [];
+        for (let j = 0; j < 4; j += 1) {
+          const p = approx.intPtr(j, 0);
+          quadPts.push({ x: p[0], y: p[1] });
+        }
+        quadCorners = orderQuadCorners(quadPts);
+        quadArea = cv.contourArea(approx);
       }
+      approx.delete();
+
+      const rotated = cv.minAreaRect(cnt);
+      const rotW = rotated.size.width;
+      const rotH = rotated.size.height;
+      const shortSide = Math.min(rotW, rotH);
+      const longSide = Math.max(rotW, rotH);
+      if (shortSide < 18 || longSide < 26) {
+        cnt.delete();
+        continue;
+      }
+
+      const ratio = longSide / shortSide;
+      if (ratio < CARD_RATIO_MIN || ratio > CARD_RATIO_MAX) {
+        cnt.delete();
+        continue;
+      }
+
+      const rotatedArea = rotW * rotH;
+      const extent = area / Math.max(rotatedArea, 1);
+      if (extent < CARD_MIN_EXTENT) {
+        cnt.delete();
+        continue;
+      }
+
+      let corners = quadCorners;
+      if (!corners) {
+        const rotPts = rotatedRectCorners(cv, rotated);
+        corners = orderQuadCorners(rotPts);
+      }
+      if (!corners) {
+        cnt.delete();
+        continue;
+      }
+
+      const aabb = cv.boundingRect(cnt);
+      const effectiveArea = quadCorners ? Math.max(area, quadArea) : area;
+      candidates.push({
+        x: aabb.x,
+        y: aabb.y,
+        w: aabb.width,
+        h: aabb.height,
+        corners,
+        area: effectiveArea,
+        extent,
+        ratio,
+        score: effectiveArea * extent,
+      });
+
       cnt.delete();
     }
 
     src.delete();
     gray.delete();
     blur.delete();
-    mask.delete();
     edges.delete();
-    merged.delete();
-    kernel.delete();
+    adaptive.delete();
+    mask.delete();
+    closed.delete();
+    closeKernel.delete();
+    openKernel.delete();
     contours.delete();
     hierarchy.delete();
 
-    candidates.sort((a, b) => (b.area * b.extent) - (a.area * a.extent));
-    return candidates.slice(0, 4).map((c) => ({
+    candidates.sort((a, b) => b.score - a.score);
+    const kept = [];
+    for (const c of candidates) {
+      const overlaps = kept.some((k) => rectIoU(k, c) > NMS_IOU_THRESHOLD);
+      if (!overlaps) kept.push(c);
+      if (kept.length >= 6) break;
+    }
+
+    return kept.map((c) => ({
       x: c.x,
       y: c.y,
       w: c.w,
       h: c.h,
+      corners: c.corners,
       nx: c.x / canvas.width,
       ny: c.y / canvas.height,
       nw: c.w / canvas.width,
@@ -294,38 +439,56 @@ function App() {
     }));
   };
 
-  const calcCenter = (box) => ({
-    x: box.nx + box.nw / 2,
-    y: box.ny + box.nh / 2,
-  });
-
-  const centerDistance = (a, b) => {
-    const c1 = calcCenter(a);
-    const c2 = calcCenter(b);
-    return Math.hypot(c1.x - c2.x, c1.y - c2.y);
-  };
-
   const mergeDetectionsIntoTracks = (detections) => {
     const now = Date.now();
-    const existing = tracksRef.current.map((t) => ({ ...t }));
+    const existing = tracksRef.current.map((t) => ({
+      ...t,
+      hitCount: t.hitCount ?? 0,
+      missCount: t.missCount ?? 0,
+      stable: t.stable ?? false,
+      sticky: t.sticky ?? false,
+    }));
     const used = new Set();
 
     for (const det of detections) {
       let bestIdx = -1;
-      let bestDist = Infinity;
+      let bestIoU = 0;
       for (let i = 0; i < existing.length; i += 1) {
         if (used.has(i)) continue;
-        const d = centerDistance(existing[i], det);
-        if (d < 0.2 && d < bestDist) {
-          bestDist = d;
+        const prevBox = { x: existing[i].nx, y: existing[i].ny, w: existing[i].nw, h: existing[i].nh };
+        const newBox = { x: det.nx, y: det.ny, w: det.nw, h: det.nh };
+        const iou = rectIoU(prevBox, newBox);
+        const centerDist = rectCenterDistance(prevBox, newBox);
+        const isMatch = iou >= TRACK_IOU_MATCH || centerDist <= TRACK_CENTER_MATCH;
+        const score = iou + Math.max(0, TRACK_CENTER_MATCH - centerDist);
+        if (isMatch && score > bestIoU) {
+          bestIoU = score;
           bestIdx = i;
         }
       }
       if (bestIdx >= 0) {
+        const nextHits = (existing[bestIdx].hitCount ?? 0) + 1;
+        const nowStable = existing[bestIdx].stable || nextHits >= MIN_STABLE_HITS;
+        const smoothedNx =
+          existing[bestIdx].nx * (1 - TRACK_SMOOTHING_ALPHA) + det.nx * TRACK_SMOOTHING_ALPHA;
+        const smoothedNy =
+          existing[bestIdx].ny * (1 - TRACK_SMOOTHING_ALPHA) + det.ny * TRACK_SMOOTHING_ALPHA;
+        const smoothedNw =
+          existing[bestIdx].nw * (1 - TRACK_SMOOTHING_ALPHA) + det.nw * TRACK_SMOOTHING_ALPHA;
+        const smoothedNh =
+          existing[bestIdx].nh * (1 - TRACK_SMOOTHING_ALPHA) + det.nh * TRACK_SMOOTHING_ALPHA;
         existing[bestIdx] = {
           ...existing[bestIdx],
           ...det,
+          nx: smoothedNx,
+          ny: smoothedNy,
+          nw: smoothedNw,
+          nh: smoothedNh,
           lastSeen: now,
+          hitCount: nextHits,
+          missCount: 0,
+          stable: nowStable,
+          sticky: existing[bestIdx].sticky || (STICKY_CONFIRMED_TRACKS && nowStable),
         };
         used.add(bestIdx);
       } else {
@@ -337,13 +500,27 @@ function App() {
           locked: false,
           endpoint: "",
           lastSeen: now,
+          hitCount: 1,
+          missCount: 0,
+          stable: false,
+          sticky: false,
         });
       }
     }
 
-    const filtered = existing.filter((t) => now - t.lastSeen <= TRACK_TTL_MS);
+    const aged = existing.map((track, idx) => {
+      if (used.has(idx) || track.lastSeen === now) return track;
+      return { ...track, missCount: (track.missCount ?? 0) + 1 };
+    });
+
+    const filtered = aged.filter((t) => {
+      if (STICKY_CONFIRMED_TRACKS && t.sticky) {
+        return now - t.lastSeen <= STICKY_MAX_IDLE_MS;
+      }
+      return now - t.lastSeen <= TRACK_TTL_MS && (t.missCount ?? 0) <= MAX_MISSED_DETECTIONS;
+    });
     tracksRef.current = filtered;
-    setLiveCards(filtered);
+    setLiveCards(filtered.filter((t) => t.stable || t.locked || t.sticky));
   };
 
   const startDetectionLoop = () => {
@@ -367,6 +544,45 @@ function App() {
   };
 
   const cropRectToBase64 = (canvas, rect) => {
+    const cv = window.cv;
+    if (opencvReady && cv && rect?.corners?.length === 4) {
+      const crop = document.createElement("canvas");
+      crop.width = CARD_WARP_WIDTH;
+      crop.height = CARD_WARP_HEIGHT;
+      const src = cv.imread(canvas);
+      const dst = new cv.Mat();
+      const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        rect.corners[0].x, rect.corners[0].y,
+        rect.corners[1].x, rect.corners[1].y,
+        rect.corners[2].x, rect.corners[2].y,
+        rect.corners[3].x, rect.corners[3].y,
+      ]);
+      const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        0, 0,
+        0, CARD_WARP_HEIGHT,
+        CARD_WARP_WIDTH, CARD_WARP_HEIGHT,
+        CARD_WARP_WIDTH, 0,
+      ]);
+      const matrix = cv.getPerspectiveTransform(srcTri, dstTri);
+      cv.warpPerspective(
+        src,
+        dst,
+        matrix,
+        new cv.Size(CARD_WARP_WIDTH, CARD_WARP_HEIGHT),
+        cv.INTER_LINEAR,
+        cv.BORDER_REPLICATE,
+        new cv.Scalar()
+      );
+      cv.imshow(crop, dst);
+      const dataUrl = crop.toDataURL("image/jpeg", 0.92);
+      src.delete();
+      dst.delete();
+      srcTri.delete();
+      dstTri.delete();
+      matrix.delete();
+      return dataUrl.split(",")[1] ?? "";
+    }
+
     const crop = document.createElement("canvas");
     crop.width = rect.w;
     crop.height = rect.h;
@@ -388,7 +604,11 @@ function App() {
     scanTimerRef.current = setInterval(async () => {
       if (mode === "live" && multiCardMode && opencvReady) {
         const now = Date.now();
-        const activeTracks = tracksRef.current.filter((t) => now - t.lastSeen < 700);
+        const activeTracks = tracksRef.current.filter(
+          (t) =>
+            (t.sticky && STICKY_CONFIRMED_TRACKS) ||
+            (now - t.lastSeen < ACTIVE_TRACK_WINDOW_MS && (t.stable || t.locked))
+        );
         const unresolved = activeTracks.filter((t) => !t.locked);
         if (unresolved.length > 0) {
           const canvas = drawCurrentFrameToCanvas();
@@ -403,16 +623,19 @@ function App() {
               const top = data.predictions[idx]?.top_prediction;
               if (!top) return track;
               const probability = top.probability ?? 0;
+              const shouldStick =
+                track.sticky || (STICKY_CONFIRMED_TRACKS && (track.stable || probability >= LOCK_THRESHOLD));
               return {
                 ...track,
                 label: top.label ?? track.label,
                 probability,
                 locked: track.locked || probability >= LOCK_THRESHOLD,
+                sticky: shouldStick,
                 endpoint,
               };
             });
             tracksRef.current = updated;
-            setLiveCards(updated);
+            setLiveCards(updated.filter((t) => t.stable || t.locked || t.sticky));
           }
         }
         if (activeTracks.length > 0) {
