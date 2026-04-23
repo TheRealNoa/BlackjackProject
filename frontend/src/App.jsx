@@ -11,7 +11,10 @@ function App() {
   const [isCameraOn, setIsCameraOn] = useState(false);
   const [isLiveScanning, setIsLiveScanning] = useState(false);
   const [scanIntervalMs, setScanIntervalMs] = useState(1200);
+  const [multiCardMode, setMultiCardMode] = useState(true);
+  const [opencvReady, setOpencvReady] = useState(false);
   const [result, setResult] = useState(null);
+  const [liveCards, setLiveCards] = useState([]);
   const [error, setError] = useState("");
 
   const videoRef = useRef(null);
@@ -35,6 +38,17 @@ function App() {
       }
     };
   }, [previewUrl]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const cv = window.cv;
+      if (cv && typeof cv.Mat === "function") {
+        setOpencvReady(true);
+        clearInterval(timer);
+      }
+    }, 400);
+    return () => clearInterval(timer);
+  }, []);
 
   const onFileChange = (event) => {
     const picked = event.target.files?.[0];
@@ -60,7 +74,7 @@ function App() {
       reader.readAsDataURL(blob);
     });
 
-  const runPrediction = async (imageBase64, source = "upload") => {
+  const runPrediction = async (imageBase64, source = "upload", writeResult = true) => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
     if (source === "upload") {
@@ -68,11 +82,15 @@ function App() {
     }
     try {
       const data = await predictCard({ imageBase64, topK });
-      setResult(data);
+      if (writeResult) {
+        setResult(data);
+      }
       setError("");
+      return data;
     } catch (err) {
       const message = err?.response?.data?.error || err.message || "Prediction failed.";
       setError(message);
+      return null;
     } finally {
       if (source === "upload") {
         setIsLoading(false);
@@ -123,11 +141,12 @@ function App() {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+    setLiveCards([]);
     setIsLiveScanning(false);
     setIsCameraOn(false);
   };
 
-  const captureFrameBase64 = () => {
+  const drawCurrentFrameToCanvas = () => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas || !video.videoWidth || !video.videoHeight) return "";
@@ -141,7 +160,81 @@ function App() {
     canvas.height = outHeight;
     const ctx = canvas.getContext("2d");
     ctx.drawImage(video, 0, 0, outWidth, outHeight);
+    return canvas;
+  };
+
+  const captureFrameBase64 = () => {
+    const canvas = drawCurrentFrameToCanvas();
+    if (!canvas) return "";
     const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+    return dataUrl.split(",")[1] ?? "";
+  };
+
+  const detectCardRects = (canvas) => {
+    const cv = window.cv;
+    if (!opencvReady || !cv || !canvas) return [];
+
+    const src = cv.imread(canvas);
+    const gray = new cv.Mat();
+    const blur = new cv.Mat();
+    const edges = new cv.Mat();
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+    cv.Canny(blur, edges, 60, 160);
+    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    const minArea = canvas.width * canvas.height * 0.02;
+    const maxArea = canvas.width * canvas.height * 0.9;
+    const candidates = [];
+
+    for (let i = 0; i < contours.size(); i += 1) {
+      const cnt = contours.get(i);
+      const area = cv.contourArea(cnt);
+      if (area < minArea || area > maxArea) {
+        cnt.delete();
+        continue;
+      }
+
+      const peri = cv.arcLength(cnt, true);
+      const approx = new cv.Mat();
+      cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+      if (approx.rows === 4 && cv.isContourConvex(approx)) {
+        const rect = cv.boundingRect(approx);
+        const ratio = rect.width / rect.height;
+        if (ratio > 0.45 && ratio < 0.95) {
+          candidates.push({
+            x: rect.x,
+            y: rect.y,
+            w: rect.width,
+            h: rect.height,
+            area,
+          });
+        }
+      }
+      approx.delete();
+      cnt.delete();
+    }
+
+    src.delete();
+    gray.delete();
+    blur.delete();
+    edges.delete();
+    contours.delete();
+    hierarchy.delete();
+
+    candidates.sort((a, b) => b.area - a.area);
+    return candidates.slice(0, 4);
+  };
+
+  const cropRectToBase64 = (canvas, rect) => {
+    const crop = document.createElement("canvas");
+    crop.width = rect.w;
+    crop.height = rect.h;
+    const ctx = crop.getContext("2d");
+    ctx.drawImage(canvas, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h);
+    const dataUrl = crop.toDataURL("image/jpeg", 0.92);
     return dataUrl.split(",")[1] ?? "";
   };
 
@@ -155,8 +248,36 @@ function App() {
     }
     setIsLiveScanning(true);
     scanTimerRef.current = setInterval(async () => {
-      const imageBase64 = captureFrameBase64();
+      const canvas = drawCurrentFrameToCanvas();
+      if (!canvas) return;
+
+      if (mode === "live" && multiCardMode && opencvReady) {
+        const rects = detectCardRects(canvas);
+        if (rects.length > 0) {
+          const detections = [];
+          for (const rect of rects) {
+            const imageBase64 = cropRectToBase64(canvas, rect);
+            const data = await runPrediction(imageBase64, "live", false);
+            const top = data?.predictions?.[0]?.top_prediction;
+            if (top) {
+              detections.push({
+                label: top.label,
+                probability: top.probability,
+                endpoint: data?.endpoint ?? "",
+              });
+            }
+          }
+          if (detections.length > 0) {
+            setLiveCards(detections);
+            setResult(null);
+            return;
+          }
+        }
+      }
+
+      const imageBase64 = canvas.toDataURL("image/jpeg", 0.9).split(",")[1] ?? "";
       if (!imageBase64) return;
+      setLiveCards([]);
       await runPrediction(imageBase64, "live");
     }, Math.max(300, Number(scanIntervalMs) || 1200));
   };
@@ -235,6 +356,14 @@ function App() {
                 value={scanIntervalMs}
                 onChange={(e) => setScanIntervalMs(Number(e.target.value || 1200))}
               />
+              <label className="checkRow">
+                <input
+                  type="checkbox"
+                  checked={multiCardMode}
+                  onChange={(e) => setMultiCardMode(e.target.checked)}
+                />
+                Detect multiple cards per frame (OpenCV)
+              </label>
 
               <div className="buttonRow">
                 {!isCameraOn ? (
@@ -261,6 +390,7 @@ function App() {
               <p className="muted small">
                 Camera: {isCameraOn ? "On" : "Off"} | Live scan: {isLiveScanning ? "Running" : "Stopped"}
               </p>
+              <p className="muted small">OpenCV detector: {opencvReady ? "Ready" : "Loading..."}</p>
             </div>
           )}
         </section>
@@ -281,7 +411,26 @@ function App() {
           <article className="panel">
             <h2>Predictions</h2>
             {error && <p className="error">{error}</p>}
-            {!error && !result && <p className="muted">No prediction yet.</p>}
+            {!error && !result && liveCards.length === 0 && <p className="muted">No prediction yet.</p>}
+            {!error && liveCards.length > 0 && (
+              <div>
+                <p>
+                  <strong>Detected cards:</strong> {liveCards.length}
+                </p>
+                <ul>
+                  {liveCards.map((card, idx) => (
+                    <li key={`${card.label}-${idx}`}>
+                      {card.label}: {(card.probability * 100).toFixed(2)}%
+                    </li>
+                  ))}
+                </ul>
+                {liveCards[0]?.endpoint && (
+                  <p className="muted small">
+                    Endpoint: <code>{liveCards[0].endpoint}</code>
+                  </p>
+                )}
+              </div>
+            )}
             {result?.predictions?.[0] && (
               <div>
                 <p>

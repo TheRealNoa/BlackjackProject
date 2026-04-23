@@ -70,6 +70,12 @@ h2 {
   font-weight: 600;
 }
 
+.checkRow {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
 input[type="file"],
 input[type="number"] {
   background: #0c1732;
