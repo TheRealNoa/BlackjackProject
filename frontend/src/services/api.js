@@ -4,6 +4,8 @@ import { getAuthIdToken } from "./authToken";
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:3000";
 const predictPath = import.meta.env.VITE_PREDICT_PATH ?? "/predict";
 const pipelinePath = (import.meta.env.VITE_PIPELINE_PATH ?? "").trim();
+const leaderboardPath = (import.meta.env.VITE_LEADERBOARD_PATH ?? "/leaderboard").trim();
+const leaderboardResultPath = (import.meta.env.VITE_LEADERBOARD_RESULT_PATH ?? "/leaderboard/result").trim();
 
 const api = axios.create({
   baseURL: apiBaseUrl,
@@ -58,5 +60,20 @@ export async function predictPipeline({
     crop_padding: cropPadding,
   };
   const res = await api.post(pipelinePath, payload);
+  return res.data;
+}
+
+export async function fetchLeaderboard({ limit = 10, minGames = 1 } = {}) {
+  const res = await api.get(leaderboardPath, {
+    params: { limit, min_games: minGames },
+  });
+  return res.data;
+}
+
+export async function submitRoundOutcome({ outcome, username }) {
+  const res = await api.post(leaderboardResultPath, {
+    outcome,
+    username,
+  });
   return res.data;
 }

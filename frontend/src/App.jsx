@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import NavBar from "./components/NavBar";
 import RequireAuth from "./components/RequireAuth";
-import { predictCard, predictCards, predictPipeline } from "./services/api";
+import { useAuth } from "./context/AuthContext";
+import {
+  fetchLeaderboard,
+  predictCard,
+  predictCards,
+  predictPipeline,
+  submitRoundOutcome,
+} from "./services/api";
 
 const USE_PIPELINE = Boolean((import.meta.env.VITE_PIPELINE_PATH ?? "").trim());
 const LIVE_TOP_K = 3;
@@ -212,6 +219,7 @@ const suggestAction = ({ dealer, player, trueCount }) => {
 };
 
 function App() {
+  const { session } = useAuth();
   const [isCameraOn, setIsCameraOn] = useState(false);
   const [isLiveScanning, setIsLiveScanning] = useState(false);
   const [detectConf] = useState(0.1);
@@ -235,6 +243,9 @@ function App() {
   const [committedPlayer, setCommittedPlayer] = useState([]);
   const [awaitTableClear, setAwaitTableClear] = useState(false);
   const [lastRoundOutcome, setLastRoundOutcome] = useState(null);
+  const [leaderboard, setLeaderboard] = useState([]);
+  const [leaderboardLoading, setLeaderboardLoading] = useState(false);
+  const [leaderboardError, setLeaderboardError] = useState("");
   const [tuning] = useState(DEFAULT_TUNING);
 
   const videoRef = useRef(null);
@@ -346,7 +357,46 @@ function App() {
     setIsLiveScanning(false);
     setError("");
     setAwaitTableClear(true);
+
+    if (session?.idToken) {
+      submitRoundOutcome({
+        outcome: who,
+        username: session.username || session.email || "",
+      })
+        .then(() => fetchLeaderboard({ limit: 10, minGames: 1 }))
+        .then((data) => {
+          setLeaderboard(data?.items ?? []);
+          setLeaderboardError("");
+        })
+        .catch((err) => {
+          const message = err?.response?.data?.error || err?.message || "Could not update leaderboard.";
+          setLeaderboardError(message);
+        });
+    }
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    setLeaderboardLoading(true);
+    fetchLeaderboard({ limit: 10, minGames: 1 })
+      .then((data) => {
+        if (cancelled) return;
+        setLeaderboard(data?.items ?? []);
+        setLeaderboardError("");
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        const message = err?.response?.data?.error || err?.message || "Could not load leaderboard.";
+        setLeaderboardError(message);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setLeaderboardLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   /** Auto-resolve when player busts, dealer busts, or dealer has ≥2 cards and stands (17+). */
   useEffect(() => {
@@ -1394,6 +1444,28 @@ function App() {
                 Then hands reset for the next round (slots cleared so you can re-anchor). The running count is
                 unchanged.
               </p>
+            </div>
+            <div className="handBlock">
+              <h3>Leaderboard (Top 10)</h3>
+              {leaderboardLoading && <p className="muted small">Loading leaderboard…</p>}
+              {!leaderboardLoading && leaderboardError && (
+                <p className="muted small">Leaderboard unavailable: {leaderboardError}</p>
+              )}
+              {!leaderboardLoading && !leaderboardError && leaderboard.length === 0 && (
+                <p className="muted small">No entries yet.</p>
+              )}
+              {!leaderboardLoading && !leaderboardError && leaderboard.length > 0 && (
+                <ol className="leaderboardList">
+                  {leaderboard.map((row) => (
+                    <li key={row.user_id}>
+                      <span>{row.username || "Unknown"}</span>
+                      <span className="muted small">
+                        W {row.wins} · L {row.losses} · P {row.pushes} · WR {row.win_rate_pct}%
+                      </span>
+                    </li>
+                  ))}
+                </ol>
+              )}
             </div>
           </article>
 
