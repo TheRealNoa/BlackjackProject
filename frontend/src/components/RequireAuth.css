@@ -1,0 +1,17 @@
+.authGateRoot {
+  align-items: center;
+  box-sizing: border-box;
+  display: flex;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 24px 16px;
+}
+
+.authGateLoading {
+  color: #a7b8d8;
+  font-size: 0.95rem;
+}
+
+.authGateLoadingText {
+  margin: 0;
+}

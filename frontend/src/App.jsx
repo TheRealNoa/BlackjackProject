@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import NavBar from "./components/NavBar";
+import RequireAuth from "./components/RequireAuth";
 import { predictCard, predictCards, predictPipeline } from "./services/api";
 
 const USE_PIPELINE = Boolean((import.meta.env.VITE_PIPELINE_PATH ?? "").trim());
@@ -1082,9 +1083,10 @@ function App() {
   };
 
   return (
-    <div className="page">
-      <div className="container">
-        <NavBar />
+    <RequireAuth>
+      <div className="page">
+        <div className="container">
+          <NavBar />
 
         <section className="panel">
           <h1>Blackjack Card Classifier</h1>
@@ -1516,6 +1518,7 @@ function App() {
         </section>
       </div>
     </div>
+    </RequireAuth>
   );
 }
 

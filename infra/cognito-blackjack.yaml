@@ -1,8 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Cognito User Pool + public app client for the Blackjack web UI (email sign-up / sign-in).
-  After deploy: set GitHub secrets VITE_COGNITO_REGION, VITE_COGNITO_USER_POOL_ID, VITE_COGNITO_CLIENT_ID
-  from stack Outputs (region is where you deployed this stack).
 
 Parameters:
   UserPoolName:

@@ -101,7 +101,7 @@ export function AuthProvider({ children }) {
           },
           onFailure: (err) => reject(err),
           newPasswordRequired: () =>
-            reject(new Error("Password change required — complete that flow in Cognito.")),
+            reject(new Error("Password change required.")),
         });
       }),
     [applySessionFromCognito]
