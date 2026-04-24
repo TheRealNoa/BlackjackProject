@@ -1133,9 +1133,8 @@ function App() {
               const pCommit = trySlotClassifierAgreement(ag, last, "player", pLabel, pProb, th, need);
 
               const dealerSnap = committedDealerRef.current;
-              const dSnapSum = handSummary(dealerSnap);
               const playerMayCommitCard = dealerSnap.length < 2;
-              const dealerMayCommitCard = dSnapSum.status !== "bust" && dSnapSum.total < 17;
+              const dealerMayCommitCard = !dealerStands(dealerSnap);
 
               if (dCommit && dealerMayCommitCard) {
                 const entry = {
