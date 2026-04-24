@@ -18,6 +18,7 @@ export default function AuthBar() {
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState("signin");
   const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [password2, setPassword2] = useState("");
   const [code, setCode] = useState("");
@@ -39,7 +40,7 @@ export default function AuthBar() {
     return (
       <div className="authBar authBarSignedIn">
         <span className="authEmail" title={session.email}>
-          {session.email || "Signed in"}
+          {session.username || session.email || "Signed in"}
         </span>
         <button type="button" className="authBtn authBtnGhost" onClick={() => signOut()}>
           Sign out
@@ -63,6 +64,7 @@ export default function AuthBar() {
       await signIn(email, password);
       setOpen(false);
       resetForm();
+      setUsername("");
     } catch (err) {
       setError(cognitoMessage(err));
     } finally {
@@ -79,7 +81,7 @@ export default function AuthBar() {
     setBusy(true);
     setError("");
     try {
-      await signUp(email, password);
+      await signUp(email, password, username);
       setPendingConfirmEmail(email.trim().toLowerCase());
       setPassword("");
       setPassword2("");
@@ -182,6 +184,17 @@ export default function AuthBar() {
           ) : mode === "signup" ? (
             <form className="authForm" onSubmit={handleSignUp}>
               <label className="authLabel">
+                Username
+                <input
+                  className="authInput"
+                  type="text"
+                  value={username}
+                  onChange={(ev) => setUsername(ev.target.value)}
+                  autoComplete="username"
+                  required
+                />
+              </label>
+              <label className="authLabel">
                 Email
                 <input
                   className="authInput"
@@ -227,6 +240,7 @@ export default function AuthBar() {
                   onClick={() => {
                     setMode("signin");
                     resetForm();
+                    setUsername("");
                   }}
                 >
                   Back to sign in
@@ -268,6 +282,7 @@ export default function AuthBar() {
                   onClick={() => {
                     setMode("signup");
                     resetForm();
+                    setUsername("");
                   }}
                 >
                   Create account

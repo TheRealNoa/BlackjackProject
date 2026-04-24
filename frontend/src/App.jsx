@@ -5,7 +5,7 @@ import { predictCard, predictCards, predictPipeline } from "./services/api";
 
 const USE_PIPELINE = Boolean((import.meta.env.VITE_PIPELINE_PATH ?? "").trim());
 const LIVE_TOP_K = 3;
-const LIVE_SCAN_INTERVAL_MS = 1200;
+const LIVE_SCAN_INTERVAL_MS = 600;
 
 const TRACK_TTL_MS = 3500;
 const DETECT_INTERVAL_MS = 250;
@@ -37,8 +37,8 @@ const DEFAULT_TUNING = {
   minStableHits: 2,
   maxMissed: 10,
   lockThreshold: 0.52,
-  /** Consecutive slot crops with same new label ≥ lockThreshold before auto-commit. */
-  slotAgreeFrames: 3,
+  /** Consecutive slot scans with same new label ≥ lockThreshold before auto-commit. */
+  slotAgreeFrames: 2,
 };
 
 // Client-side OpenCV multi-card path (contours + tracking). Re-enabled after abandoning the YOLO pipeline.
@@ -95,6 +95,23 @@ const handSummary = (cards) => {
   if (total === 21 && classified.length === 2) return { total, status: "blackjack" };
   if (total === 21) return { total, status: "twenty-one" };
   return { total, status: "ok" };
+};
+
+/** Dealer stands on hard/soft 17+ (no more hole-card hits). */
+const dealerStands = (dealerCards) => {
+  const s = handSummary(dealerCards);
+  if (s.status === "bust") return true;
+  return s.total >= 17;
+};
+
+const resolveRoundOutcome = (dealerCards, playerCards) => {
+  const d = handSummary(dealerCards);
+  const p = handSummary(playerCards);
+  if (p.status === "bust") return "dealer";
+  if (d.status === "bust") return "player";
+  if (p.total > d.total) return "player";
+  if (d.total > p.total) return "dealer";
+  return "push";
 };
 
 const HI_LO_VALUES = {
@@ -209,13 +226,15 @@ function App() {
   const [playerSlot, setPlayerSlot] = useState(null);
   const [slotPreview, setSlotPreview] = useState(emptySlotPreview);
 
-  const [numDecks, setNumDecks] = useState(6);
+  const [numDecks, setNumDecks] = useState(1);
   const [burnedCards, setBurnedCards] = useState(1);
   const [runningCount, setRunningCount] = useState(0);
   const [cardsSeen, setCardsSeen] = useState(0);
   const [roundsWon, setRoundsWon] = useState({ player: 0, dealer: 0, push: 0 });
   const [committedDealer, setCommittedDealer] = useState([]);
   const [committedPlayer, setCommittedPlayer] = useState([]);
+  const [awaitTableClear, setAwaitTableClear] = useState(false);
+  const [lastRoundOutcome, setLastRoundOutcome] = useState(null);
   const [tuning] = useState(DEFAULT_TUNING);
 
   const videoRef = useRef(null);
@@ -288,9 +307,93 @@ function App() {
     lastCommittedSlotLabelRef.current.player = committedPlayer.at(-1)?.label ?? null;
   }, [committedDealer, committedPlayer]);
 
+  const committedDealerRef = useRef([]);
+  const committedPlayerRef = useRef([]);
+  const lastAutoScoredHandSigRef = useRef("");
+  useEffect(() => {
+    committedDealerRef.current = committedDealer;
+  }, [committedDealer]);
+  useEffect(() => {
+    committedPlayerRef.current = committedPlayer;
+  }, [committedPlayer]);
+
+  const clearTableForNextRound = () => {
+    tracksRef.current = [];
+    discoveryAnchoredRef.current = { dealer: false, player: false };
+    slotAgreeRef.current = {
+      dealer: { streak: 0, candidate: null },
+      player: { streak: 0, candidate: null },
+    };
+    dealerSlotRef.current = null;
+    playerSlotRef.current = null;
+    setLiveCards([]);
+    setDealerSlot(null);
+    setPlayerSlot(null);
+    setSlotPreview(emptySlotPreview());
+    setCommittedDealer([]);
+    setCommittedPlayer([]);
+  };
+
+  const endRoundWithWinner = (who) => {
+    if (who !== "player" && who !== "dealer" && who !== "push") return;
+    setRoundsWon((prev) => ({ ...prev, [who]: prev[who] + 1 }));
+    setLastRoundOutcome(who);
+    clearTableForNextRound();
+    if (scanTimerRef.current) {
+      clearInterval(scanTimerRef.current);
+      scanTimerRef.current = null;
+    }
+    setIsLiveScanning(false);
+    setError("");
+    setAwaitTableClear(true);
+  };
+
+  /** Auto-resolve when player busts, dealer busts, or dealer has ≥2 cards and stands (17+). */
+  useEffect(() => {
+    if (!ENABLE_OPENCV_MULTICARD || USE_PIPELINE) return;
+
+    const dealer = committedDealer;
+    const player = committedPlayer;
+    if (dealer.length === 0 && player.length === 0) {
+      lastAutoScoredHandSigRef.current = "";
+      return;
+    }
+
+    const handSig = `${dealer.map((c) => c.id).join(",")}|${player.map((c) => c.id).join(",")}`;
+    const d = handSummary(dealer);
+    const p = handSummary(player);
+    const playerClassified = player.filter((c) => parseCardLabel(c.label));
+
+    let outcome = null;
+    if (p.status === "bust") outcome = "dealer";
+    else if (d.status === "bust") outcome = "player";
+    else if (
+      dealer.length >= 2 &&
+      playerClassified.length >= 1 &&
+      p.status !== "empty" &&
+      d.total === p.total
+    ) {
+      outcome = "push";
+    } else if (
+      dealer.length >= 2 &&
+      playerClassified.length >= 2 &&
+      d.status !== "bust" &&
+      d.total > p.total
+    ) {
+      outcome = "dealer";
+    } else if (dealer.length >= 2 && dealerStands(dealer) && playerClassified.length >= 1) {
+      outcome = resolveRoundOutcome(dealer, player);
+    }
+    if (!outcome) return;
+    if (lastAutoScoredHandSigRef.current === handSig) return;
+    lastAutoScoredHandSigRef.current = handSig;
+    endRoundWithWinner(outcome);
+  }, [committedDealer, committedPlayer]);
+
   /** First card per side: OpenCV track locks → save fixed slot + commit (one card at a time per half). */
   useEffect(() => {
     if (!ENABLE_OPENCV_MULTICARD || USE_PIPELINE) return;
+    if (awaitTableClear) return;
     if (dealerSlot && playerSlot) return;
     if (liveCards.length === 0) return;
 
@@ -345,7 +448,7 @@ function App() {
     tracksRef.current = [];
     setLiveCards([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- drawCurrentFrameToCanvas is stable for this effect
-  }, [liveCards, dealerSlot, playerSlot]);
+  }, [liveCards, dealerSlot, playerSlot, awaitTableClear]);
 
   const runPrediction = async (imageBase64) => {
     if (inFlightRef.current) return;
@@ -428,26 +531,9 @@ function App() {
     setRunningCount(0);
     setCardsSeen(0);
     setRoundsWon({ player: 0, dealer: 0, push: 0 });
+    setAwaitTableClear(false);
+    setLastRoundOutcome(null);
     setError("");
-  };
-
-  const recordRoundWinner = (who) => {
-    if (who !== "player" && who !== "dealer" && who !== "push") return;
-    setRoundsWon((prev) => ({ ...prev, [who]: prev[who] + 1 }));
-    tracksRef.current = [];
-    discoveryAnchoredRef.current = { dealer: false, player: false };
-    slotAgreeRef.current = {
-      dealer: { streak: 0, candidate: null },
-      player: { streak: 0, candidate: null },
-    };
-    dealerSlotRef.current = null;
-    playerSlotRef.current = null;
-    setLiveCards([]);
-    setDealerSlot(null);
-    setPlayerSlot(null);
-    setSlotPreview(emptySlotPreview());
-    setCommittedDealer([]);
-    setCommittedPlayer([]);
   };
 
   const startCamera = async () => {
@@ -945,11 +1031,7 @@ function App() {
     return cropRectToBase64(canvas, { x, y, w, h, nx: slot.nx, ny: slot.ny, nw: slot.nw, nh: slot.nh });
   };
 
-  const startLiveScan = () => {
-    if (!isCameraOn) {
-      setError("Start camera first.");
-      return;
-    }
+  const attachLiveScanInterval = () => {
     if (scanTimerRef.current) {
       clearInterval(scanTimerRef.current);
     }
@@ -962,7 +1044,7 @@ function App() {
 
         if (dealerSlotRef.current && playerSlotRef.current) {
           const th = tuningRef.current.lockThreshold;
-          const need = Math.max(2, Math.round(tuningRef.current.slotAgreeFrames ?? 3));
+          const need = Math.max(1, Math.round(tuningRef.current.slotAgreeFrames ?? 2));
 
           if (!inFlightRef.current) {
             const d64 = cropSlotToBase64(canvas, dealerSlotRef.current);
@@ -987,7 +1069,12 @@ function App() {
               const dCommit = trySlotClassifierAgreement(ag, last, "dealer", dLabel, dProb, th, need);
               const pCommit = trySlotClassifierAgreement(ag, last, "player", pLabel, pProb, th, need);
 
-              if (dCommit) {
+              const dealerSnap = committedDealerRef.current;
+              const dSnapSum = handSummary(dealerSnap);
+              const playerMayCommitCard = dealerSnap.length < 2;
+              const dealerMayCommitCard = dSnapSum.status !== "bust" && dSnapSum.total < 17;
+
+              if (dCommit && dealerMayCommitCard) {
                 const entry = {
                   id: nextHandCardIdRef.current++,
                   label: dCommit.label,
@@ -998,7 +1085,7 @@ function App() {
                 setRunningCount((v) => v + hiLoDelta(dCommit.label));
                 setCardsSeen((v) => v + 1);
               }
-              if (pCommit) {
+              if (pCommit && playerMayCommitCard) {
                 const entry = {
                   id: nextHandCardIdRef.current++,
                   label: pCommit.label,
@@ -1069,6 +1156,27 @@ function App() {
     }, LIVE_SCAN_INTERVAL_MS);
   };
 
+  const startLiveScan = () => {
+    if (!isCameraOn) {
+      setError("Start camera first.");
+      return;
+    }
+    if (awaitTableClear) {
+      setError("Remove the old cards from the frame, then tap Continue below.");
+      return;
+    }
+    setError("");
+    attachLiveScanInterval();
+  };
+
+  const continueAfterTableClear = () => {
+    setAwaitTableClear(false);
+    setLastRoundOutcome(null);
+    setError("");
+    if (!isCameraOn) return;
+    attachLiveScanInterval();
+  };
+
   const stopLiveScan = () => {
     if (scanTimerRef.current) {
       clearInterval(scanTimerRef.current);
@@ -1082,6 +1190,87 @@ function App() {
     setIsLiveScanning(false);
   };
 
+  const dealerCards = committedDealer;
+  const playerCards = committedPlayer;
+  const scanningDealer = [];
+  const scanningPlayer = [];
+  for (const card of liveCards) {
+    const centerY = (card.ny ?? 0) + (card.nh ?? 0) / 2;
+    (centerY < 0.5 ? scanningDealer : scanningPlayer).push(card);
+  }
+  const slotMode = ENABLE_OPENCV_MULTICARD && !USE_PIPELINE;
+  const leader = currentRoundLeader(dealerCards, playerCards);
+  const decksRemaining = Math.max(0.25, numDecks - (cardsSeen + burnedCards) / 52);
+  const trueCount = runningCount / decksRemaining;
+  const suggestion = suggestAction({
+    dealer: dealerCards,
+    player: playerCards,
+    trueCount,
+  });
+  const suggestionTone = (() => {
+    const s = suggestion.toLowerCase();
+    if (s.includes("push")) return "suggestionPush";
+    if (s.includes("stand") || s.includes("hold")) return "suggestionHold";
+    return "";
+  })();
+  const slotPrompt = (() => {
+    if (!slotMode || !isLiveScanning) return null;
+    if (!dealerSlot) {
+      return "Hold one dealer card in the upper half until it locks (green/yellow box). That fixes the dealer slot.";
+    }
+    if (!playerSlot) {
+      return "Dealer slot is set. Hold one player card in the lower half until it locks.";
+    }
+    return "Slots are set. The scanner adds cards when it agrees on a read. After the dealer has two cards you cannot add player cards; the dealer then draws until 17 or higher.";
+  })();
+  const roundOverlayText = (() => {
+    if (!awaitTableClear || !lastRoundOutcome) return "";
+    if (lastRoundOutcome === "player") return "Player wins";
+    if (lastRoundOutcome === "dealer") return "Dealer wins";
+    return "Push";
+  })();
+  const roundOverlayClass = `roundOverlay ${
+    lastRoundOutcome === "player" ? "player" : lastRoundOutcome === "dealer" ? "dealer" : "push"
+  }`;
+
+  const renderHand = (title, hand, scanning) => {
+    const summary = handSummary(hand);
+    return (
+      <div className="handBlock" key={title}>
+        <h3>
+          {title}{" "}
+          {summary.status !== "empty" && (
+            <span className="handTotal">— {summary.total}</span>
+          )}
+          {summary.status === "bust" && <span className="muted small"> bust</span>}
+          {summary.status === "blackjack" && (
+            <span className="muted small"> blackjack!</span>
+          )}
+          {summary.status === "twenty-one" && (
+            <span className="muted small"> 21</span>
+          )}
+        </h3>
+        {hand.length === 0 && scanning.length === 0 ? (
+          <p className="muted small">No cards yet.</p>
+        ) : (
+          <ul>
+            {hand.map((card, idx) => (
+              <li key={`c-${card.id}`}>
+                Card {idx + 1}: <strong>{card.label}</strong>{" "}
+                ({(card.probability * 100).toFixed(0)}%)
+              </li>
+            ))}
+            {scanning.map((card) => (
+              <li key={`s-${card.id}`} className="muted small">
+                Scanning: {card.label ? `${card.label} (${(card.probability * 100).toFixed(0)}%)` : "…"}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    );
+  };
+
   return (
     <RequireAuth>
       <div className="page">
@@ -1091,34 +1280,39 @@ function App() {
         <section className="panel">
           <h1>Blackjack Card Classifier</h1>
           <p className="muted">
-            Live camera only. Dealer uses the upper half of the frame, player the lower half. After each side&apos;s
-            first card, new cards are added when the model agrees on the same new label for several scans in a row.
+            Practice blackjack with your camera: lock dealer and player slots on the felt, let the model read cards as
+            you play, and get basic-strategy hints with a Hi-Lo running count.
           </p>
 
+          <details className="settingsDetails">
+            <summary className="settingsSummary">Settings</summary>
+            <div className="form settingsFormInner">
+              <label className="label">Decks in shoe</label>
+              <select value={numDecks} onChange={(e) => setNumDecks(Number(e.target.value))}>
+                <option value={1}>1</option>
+                <option value={2}>2</option>
+                <option value={4}>4</option>
+                <option value={6}>6</option>
+                <option value={8}>8</option>
+              </select>
+
+              <label className="label">Cards burned / thrown out at shuffle: {burnedCards}</label>
+              <input
+                type="number"
+                min={0}
+                max={52}
+                step={1}
+                value={burnedCards}
+                onChange={(e) => setBurnedCards(Math.max(0, Number(e.target.value) || 0))}
+              />
+              <p className="muted small">
+                In most casinos the dealer burns 1 card after a shuffle, and sometimes more are discarded. Those cards
+                are not visible but are gone from the shoe.
+              </p>
+            </div>
+          </details>
+
           <div className="form">
-            <label className="label">Decks in shoe</label>
-            <select value={numDecks} onChange={(e) => setNumDecks(Number(e.target.value))}>
-              <option value={1}>1</option>
-              <option value={2}>2</option>
-              <option value={4}>4</option>
-              <option value={6}>6</option>
-              <option value={8}>8</option>
-            </select>
-
-            <label className="label">Cards burned / thrown out at shuffle: {burnedCards}</label>
-            <input
-              type="number"
-              min={0}
-              max={52}
-              step={1}
-              value={burnedCards}
-              onChange={(e) => setBurnedCards(Math.max(0, Number(e.target.value) || 0))}
-            />
-            <p className="muted small">
-              In most casinos the dealer burns 1 card after a shuffle, and sometimes more are discarded. Those cards
-              are not visible but are gone from the shoe.
-            </p>
-
             <div className="buttonRow" style={{ marginTop: "0.75rem" }}>
               {!isCameraOn ? (
                 <button type="button" onClick={startCamera}>
@@ -1131,7 +1325,7 @@ function App() {
               )}
 
               {!isLiveScanning ? (
-                <button type="button" disabled={!isCameraOn} onClick={startLiveScan}>
+                <button type="button" disabled={!isCameraOn || awaitTableClear} onClick={startLiveScan}>
                   Start Live Scan
                 </button>
               ) : (
@@ -1144,15 +1338,71 @@ function App() {
             <p className="muted small">
               Camera: {isCameraOn ? "On" : "Off"} | Live scan: {isLiveScanning ? "Running" : "Stopped"}
             </p>
+
+            {awaitTableClear && (
+              <div className="tableClearBanner">
+                <p className="tableClearText">
+                  Round finished — take the cards off the table so the camera won&apos;t pick them up again.
+                </p>
+                <button type="button" className="tableClearBtn" onClick={continueAfterTableClear}>
+                  Continue
+                </button>
+              </div>
+            )}
           </div>
         </section>
 
-        <section className="grid">
-          <article className="panel">
+        <section className="cameraLayout">
+          <article className="panel sidePanel">
+            <h2>Round info</h2>
+            {error && <p className="error">{error}</p>}
+            <div className="handBlock">
+              <h3>Who's ahead</h3>
+              <p>
+                {leader === "player" && (
+                  <>
+                    <strong>Player</strong> leads this round.
+                  </>
+                )}
+                {leader === "dealer" && (
+                  <>
+                    <strong>Dealer</strong> leads this round.
+                  </>
+                )}
+                {leader === "push" && <>Currently a push.</>}
+                {leader === null && <span className="muted">Waiting for cards.</span>}
+              </p>
+            </div>
+            <div className="handBlock">
+              <h3>Suggested action</h3>
+              <p className={`suggestionBadge ${suggestionTone}`}>
+                <strong>{suggestion}</strong>
+              </p>
+              <p className="muted small">
+                Basic strategy with a few count-based deviations (Hi-Lo). Not financial advice.
+              </p>
+            </div>
+            <div className="handBlock">
+              <h3>Rounds won</h3>
+              <p>
+                Player: <strong>{roundsWon.player}</strong> · Dealer:{" "}
+                <strong>{roundsWon.dealer}</strong> · Pushes:{" "}
+                <strong>{roundsWon.push}</strong>
+              </p>
+              <p className="muted small">
+                A round ends when someone busts, or when the dealer has at least two cards and stands on 17+.
+                Then hands reset for the next round (slots cleared so you can re-anchor). The running count is
+                unchanged.
+              </p>
+            </div>
+          </article>
+
+          <article className="panel cameraMainPanel">
             <h2>Table view</h2>
             <div className="liveContainer">
                 <video ref={videoRef} className="preview livePreview" autoPlay playsInline muted />
                 <canvas ref={canvasRef} className="hiddenCanvas" />
+                {roundOverlayText && <div className={roundOverlayClass}>{roundOverlayText}</div>}
                 <div className="tableDivider" />
                 <span className="tableZoneLabel dealer">Dealer</span>
                 <span className="tableZoneLabel player">Player</span>
@@ -1264,175 +1514,42 @@ function App() {
               </div>
           </article>
 
-          <article className="panel">
-            <h2>Blackjack table</h2>
-            {error && <p className="error">{error}</p>}
-
-            {(() => {
-              const dealerCards = committedDealer;
-              const playerCards = committedPlayer;
-              const scanningDealer = [];
-              const scanningPlayer = [];
-              for (const card of liveCards) {
-                const centerY = (card.ny ?? 0) + (card.nh ?? 0) / 2;
-                (centerY < 0.5 ? scanningDealer : scanningPlayer).push(card);
-              }
-              const slotMode = ENABLE_OPENCV_MULTICARD && !USE_PIPELINE;
-              const leader = currentRoundLeader(dealerCards, playerCards);
-              const decksRemaining = Math.max(
-                0.25,
-                numDecks - (cardsSeen + burnedCards) / 52
-              );
-              const trueCount = runningCount / decksRemaining;
-              const suggestion = suggestAction({
-                dealer: dealerCards,
-                player: playerCards,
-                trueCount,
-              });
-
-              const renderHand = (title, hand, scanning) => {
-                const summary = handSummary(hand);
-                return (
-                  <div className="handBlock" key={title}>
-                    <h3>
-                      {title}{" "}
-                      {summary.status !== "empty" && (
-                        <span className="handTotal">— {summary.total}</span>
-                      )}
-                      {summary.status === "bust" && <span className="muted small"> bust</span>}
-                      {summary.status === "blackjack" && (
-                        <span className="muted small"> blackjack!</span>
-                      )}
-                      {summary.status === "twenty-one" && (
-                        <span className="muted small"> 21</span>
-                      )}
-                    </h3>
-                    {hand.length === 0 && scanning.length === 0 ? (
-                      <p className="muted small">No cards yet.</p>
-                    ) : (
-                      <ul>
-                        {hand.map((card, idx) => (
-                          <li key={`c-${card.id}`}>
-                            Card {idx + 1}: <strong>{card.label}</strong>{" "}
-                            ({(card.probability * 100).toFixed(0)}%)
-                          </li>
-                        ))}
-                        {scanning.map((card) => (
-                          <li key={`s-${card.id}`} className="muted small">
-                            Scanning: {card.label ? `${card.label} (${(card.probability * 100).toFixed(0)}%)` : "…"}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                );
-              };
-
-              const slotPrompt = (() => {
-                if (!slotMode || !isLiveScanning) return null;
-                if (!dealerSlot) {
-                  return "Hold one dealer card in the upper half until it locks (green/yellow box). That fixes the dealer slot.";
-                }
-                if (!playerSlot) {
-                  return "Dealer slot is set. Hold one player card in the lower half until it locks.";
-                }
-                return `Slots are fixed. Place the next card in a slot; when the model holds the same new card at ≥${Math.round(tuning.lockThreshold * 100)}% confidence for ${Math.max(2, Math.round(tuning.slotAgreeFrames ?? 3))} scans in a row (and it is not the same as the last card in that hand), it is added automatically.`;
-              })();
-
-              return (
-                <div>
-                  {slotPrompt && (
-                    <div className="handBlock">
-                      <h3>Live scan steps</h3>
-                      <p className="muted small">{slotPrompt}</p>
-                      {dealerSlot && playerSlot && (
-                        <p className="muted small" style={{ marginTop: "0.35rem" }}>
-                          The table view shows each slot&apos;s current readout each scan.
-                        </p>
-                      )}
-                    </div>
-                  )}
-                  {renderHand("Dealer's cards", dealerCards, scanningDealer)}
-                  {renderHand("Player's cards", playerCards, scanningPlayer)}
-
-                  <div className="handBlock">
-                    <h3>Who's ahead</h3>
-                    <p>
-                      {leader === "player" && (
-                        <>
-                          <strong>Player</strong> leads this round.
-                        </>
-                      )}
-                      {leader === "dealer" && (
-                        <>
-                          <strong>Dealer</strong> leads this round.
-                        </>
-                      )}
-                      {leader === "push" && <>Currently a push.</>}
-                      {leader === null && <span className="muted">Waiting for cards.</span>}
-                    </p>
-                  </div>
-
-                  <div className="handBlock">
-                    <h3>Suggested action</h3>
-                    <p>
-                      <strong>{suggestion}</strong>
-                    </p>
-                    <p className="muted small">
-                      Basic strategy with a few count-based deviations (Hi-Lo). Not financial advice.
-                    </p>
-                  </div>
-
-                  <div className="handBlock">
-                    <h3>Card counting (Hi-Lo)</h3>
-                    <ul>
-                      <li>Running count: <strong>{runningCount}</strong></li>
-                      <li>True count: <strong>{trueCount.toFixed(2)}</strong></li>
-                      <li>Cards seen: {cardsSeen}</li>
-                      <li>Decks remaining: ~{decksRemaining.toFixed(2)} / {numDecks}</li>
-                      <li>Burned / discarded: {burnedCards}</li>
-                    </ul>
-                  </div>
-
-                  <div className="handBlock">
-                    <h3>Rounds</h3>
-                    <p>
-                      Player: <strong>{roundsWon.player}</strong> · Dealer:{" "}
-                      <strong>{roundsWon.dealer}</strong> · Pushes:{" "}
-                      <strong>{roundsWon.push}</strong>
-                    </p>
-                    <div className="buttonRow">
-                      <button type="button" onClick={() => recordRoundWinner("player")}>
-                        Player won
-                      </button>
-                      <button type="button" onClick={() => recordRoundWinner("dealer")}>
-                        Dealer won
-                      </button>
-                      <button type="button" onClick={() => recordRoundWinner("push")}>
-                        Push
-                      </button>
-                    </div>
-                    <p className="muted small">
-                      Recording a round clears the table and dealer/player slots so you can anchor fresh spots. The
-                      running count is unchanged (cards stay out of the shoe).
-                    </p>
-                  </div>
-
-                  <div className="handBlock">
-                    <div className="buttonRow">
-                      <button type="button" onClick={resetAll}>
-                        Reset everything
-                      </button>
-                    </div>
-                    <p className="muted small">
-                      Resets the running count, cards seen, round scores, and current table. Use this when a new shoe
-                      is shuffled in.
-                    </p>
-                  </div>
-
-                </div>
-              );
-            })()}
+          <article className="panel sidePanel">
+            <h2>Hands & count</h2>
+            {slotPrompt && (
+              <div className="handBlock">
+                <h3>Live scan steps</h3>
+                <p className="muted small">{slotPrompt}</p>
+                {dealerSlot && playerSlot && (
+                  <p className="muted small" style={{ marginTop: "0.35rem" }}>
+                    The table view shows each slot&apos;s current readout each scan.
+                  </p>
+                )}
+              </div>
+            )}
+            {renderHand("Dealer's cards", dealerCards, scanningDealer)}
+            {renderHand("Player's cards", playerCards, scanningPlayer)}
+            <div className="handBlock">
+              <h3>Card counting (Hi-Lo)</h3>
+              <ul>
+                <li>Running count: <strong>{runningCount}</strong></li>
+                <li>True count: <strong>{trueCount.toFixed(2)}</strong></li>
+                <li>Cards seen: {cardsSeen}</li>
+                <li>Decks remaining: ~{decksRemaining.toFixed(2)} / {numDecks}</li>
+                <li>Burned / discarded: {burnedCards}</li>
+              </ul>
+            </div>
+            <div className="handBlock">
+              <div className="buttonRow">
+                <button type="button" onClick={resetAll}>
+                  Reset everything
+                </button>
+              </div>
+              <p className="muted small">
+                Resets the running count, cards seen, round scores, and current table. Use this when a new shoe
+                is shuffled in.
+              </p>
+            </div>
             {!error && pipelineResult && (
               <div>
                 {pipelineResult.message && <p className="muted">{pipelineResult.message}</p>}

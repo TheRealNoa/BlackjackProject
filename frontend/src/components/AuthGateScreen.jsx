@@ -9,6 +9,7 @@ export default function AuthGateScreen() {
 
   const [mode, setMode] = useState("signin");
   const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [password2, setPassword2] = useState("");
   const [code, setCode] = useState("");
@@ -30,6 +31,7 @@ export default function AuthGateScreen() {
     try {
       await signIn(email, password);
       resetForm();
+      setUsername("");
     } catch (err) {
       setError(cognitoMessage(err));
     } finally {
@@ -46,7 +48,7 @@ export default function AuthGateScreen() {
     setBusy(true);
     setError("");
     try {
-      await signUp(email, password);
+      await signUp(email, password, username);
       setPendingConfirmEmail(email.trim().toLowerCase());
       setPassword("");
       setPassword2("");
@@ -128,6 +130,17 @@ export default function AuthGateScreen() {
         ) : mode === "signup" ? (
           <form className="authForm authGateForm" onSubmit={handleSignUp}>
             <label className="authLabel">
+              Username
+              <input
+                className="authInput"
+                type="text"
+                value={username}
+                onChange={(ev) => setUsername(ev.target.value)}
+                autoComplete="username"
+                required
+              />
+            </label>
+            <label className="authLabel">
               Email
               <input
                 className="authInput"
@@ -173,6 +186,7 @@ export default function AuthGateScreen() {
                 onClick={() => {
                   setMode("signin");
                   resetForm();
+                  setUsername("");
                 }}
               >
                 Back to sign in
@@ -214,6 +228,7 @@ export default function AuthGateScreen() {
                 onClick={() => {
                   setMode("signup");
                   resetForm();
+                  setUsername("");
                 }}
               >
                 Create account

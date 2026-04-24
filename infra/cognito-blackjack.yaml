@@ -46,8 +46,10 @@ Resources:
       PreventUserExistenceErrors: ENABLED
       ReadAttributes:
         - email
+        - preferred_username
       WriteAttributes:
         - email
+        - preferred_username
       AccessTokenValidity: 60
       IdTokenValidity: 60
       RefreshTokenValidity: 30

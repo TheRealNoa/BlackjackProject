@@ -40,13 +40,16 @@ export function AuthProvider({ children }) {
     const accessTok = s.getAccessToken().getJwtToken();
     const refreshTok = s.getRefreshToken()?.getToken() ?? "";
     let email = "";
+    let username = "";
     try {
       const payload = s.getIdToken().decodePayload();
       email = payload.email || payload["cognito:username"] || "";
+      username = payload.preferred_username || payload["cognito:username"] || "";
     } catch {
       email = "";
+      username = "";
     }
-    const next = { email, idToken: idTok, accessToken: accessTok, refreshToken: refreshTok };
+    const next = { email, username, idToken: idTok, accessToken: accessTok, refreshToken: refreshTok };
     setSession(next);
     setAuthIdToken(idTok);
   }, []);
@@ -108,18 +111,26 @@ export function AuthProvider({ children }) {
   );
 
   const signUp = useCallback(
-    (email, password) =>
+    (email, password, username) =>
       new Promise((resolve, reject) => {
         const p = getPool();
         if (!p) {
           reject(new Error("Cognito is not configured"));
           return;
         }
-        const username = email.trim().toLowerCase();
+        const emailNorm = email.trim().toLowerCase();
+        const preferredUsername = String(username ?? "").trim();
+        if (!preferredUsername) {
+          reject(new Error("Username is required."));
+          return;
+        }
         p.signUp(
-          username,
+          emailNorm,
           password,
-          [{ Name: "email", Value: username }],
+          [
+            { Name: "email", Value: emailNorm },
+            { Name: "preferred_username", Value: preferredUsername },
+          ],
           null,
           (err, result) => {
             if (err) reject(err);
