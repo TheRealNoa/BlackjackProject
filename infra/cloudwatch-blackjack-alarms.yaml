@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudWatch alarms for the predict Lambda (errors, throttles, duration).
+
+Parameters:
+  PredictLambdaName:
+    Type: String
+    Description: Name of the predict Lambda
+    Default: cards-predict-lambda
+  DurationThresholdMs:
+    Type: Number
+    Description: Alarm when Lambda Duration Maximum exceeds this (ms)
+    Default: 48000
+  AlarmNotificationEmail:
+    Type: String
+    Description: Email for SNS alarm notifications
+    Default: ""
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmNotificationEmail, ""]]
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      DisplayName: blackjack-api-alarms
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlarmNotificationEmail
+      TopicArn: !Ref AlarmTopic
+
+  PredictErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${PredictLambdaName}-errors"
+      AlarmDescription: Predict Lambda reported Errors > 0
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PredictLambdaName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref "AWS::NoValue"]
+
+  PredictThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${PredictLambdaName}-throttles"
+      AlarmDescription: Predict Lambda throttled
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PredictLambdaName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref "AWS::NoValue"]
+
+  PredictDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${PredictLambdaName}-duration-high"
+      AlarmDescription: Predict Lambda max duration approaching timeout
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PredictLambdaName
+      ExtendedStatistic: p99
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: !Ref DurationThresholdMs
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref "AWS::NoValue"]
+
+Outputs:
+  AlarmTopicArn:
+    Condition: HasAlarmEmail
+    Description: SNS topic ARN
+    Value: !Ref AlarmTopic
