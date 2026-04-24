@@ -92,6 +92,23 @@ const handTotal = (cards) => {
   return total;
 };
 
+/** True if at least one ace can count as 11 without busting (standard "soft" hand). */
+const handIsSoft = (cards) => {
+  const classified = cards.filter((c) => parseCardLabel(c.label));
+  if (classified.length === 0) return false;
+  let minTotal = 0;
+  let aceCount = 0;
+  for (const c of classified) {
+    const parsed = parseCardLabel(c.label);
+    if (!parsed) continue;
+    const v = RANK_VALUES[parsed.rank];
+    minTotal += parsed.rank === "ace" ? 1 : v;
+    if (parsed.rank === "ace") aceCount += 1;
+  }
+  if (aceCount === 0) return false;
+  return minTotal + 10 <= 21;
+};
+
 const handSummary = (cards) => {
   const classified = cards.filter((c) => parseCardLabel(c.label));
   const total = handTotal(classified);
@@ -104,10 +121,12 @@ const handSummary = (cards) => {
   return { total, status: "ok" };
 };
 
-/** Dealer stands on hard/soft 17+ (no more hole-card hits). */
+/** Dealer stands on 17+ except soft 17 (ace + 6 style), which continues until hard 17+ or bust. */
 const dealerStands = (dealerCards) => {
   const s = handSummary(dealerCards);
   if (s.status === "bust") return true;
+  if (s.total > 17) return true;
+  if (s.total === 17 && handIsSoft(dealerCards)) return false;
   return s.total >= 17;
 };
 
@@ -398,7 +417,7 @@ function App() {
     };
   }, []);
 
-  /** Auto-resolve when player busts, dealer busts, or dealer has ≥2 cards and stands (17+). */
+  /** Auto-resolve when player busts, dealer busts, or dealer has ≥2 cards and stands (hard 17+; hits soft 17). */
   useEffect(() => {
     if (!ENABLE_OPENCV_MULTICARD || USE_PIPELINE) return;
 
@@ -417,22 +436,16 @@ function App() {
     let outcome = null;
     if (p.status === "bust") outcome = "dealer";
     else if (d.status === "bust") outcome = "player";
-    else if (
-      dealer.length >= 2 &&
-      playerClassified.length >= 1 &&
-      p.status !== "empty" &&
-      d.total === p.total
-    ) {
-      outcome = "push";
-    } else if (
-      dealer.length >= 2 &&
-      playerClassified.length >= 2 &&
-      d.status !== "bust" &&
-      d.total > p.total
-    ) {
-      outcome = "dealer";
-    } else if (dealer.length >= 2 && dealerStands(dealer) && playerClassified.length >= 1) {
-      outcome = resolveRoundOutcome(dealer, player);
+    else if (dealer.length >= 2 && dealerStands(dealer) && playerClassified.length >= 1) {
+      if (p.status !== "empty" && d.total === p.total) outcome = "push";
+      else if (
+        playerClassified.length >= 2 &&
+        d.total > p.total
+      ) {
+        outcome = "dealer";
+      } else {
+        outcome = resolveRoundOutcome(dealer, player);
+      }
     }
     if (!outcome) return;
     if (lastAutoScoredHandSigRef.current === handSig) return;
@@ -1271,7 +1284,7 @@ function App() {
     if (!playerSlot) {
       return "Dealer slot is set. Hold one player card in the lower half until it locks.";
     }
-    return "Slots are set. The scanner adds cards when it agrees on a read. After the dealer has two cards you cannot add player cards; the dealer then draws until 17 or higher.";
+    return "Slots are set. The scanner adds cards when it agrees on a read. After the dealer has two cards you cannot add player cards; the dealer then draws until hard 17 or higher (will take another card on soft 17).";
   })();
   const roundOverlayText = (() => {
     if (!awaitTableClear || !lastRoundOutcome) return "";
@@ -1440,7 +1453,7 @@ function App() {
                 <strong>{roundsWon.push}</strong>
               </p>
               <p className="muted small">
-                A round ends when someone busts, or when the dealer has at least two cards and stands on 17+.
+                      A round ends when someone busts, or when the dealer has at least two cards and stands on hard 17+ (dealer hits soft 17).
                 Then hands reset for the next round (slots cleared so you can re-anchor). The running count is
                 unchanged.
               </p>
