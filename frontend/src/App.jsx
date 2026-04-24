@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import NavBar from "./components/NavBar";
 import { predictCard, predictCards, predictPipeline } from "./services/api";
 
 const USE_PIPELINE = Boolean((import.meta.env.VITE_PIPELINE_PATH ?? "").trim());
+const LIVE_TOP_K = 3;
+const LIVE_SCAN_INTERVAL_MS = 1200;
 
 const TRACK_TTL_MS = 3500;
 const DETECT_INTERVAL_MS = 250;
@@ -34,6 +36,8 @@ const DEFAULT_TUNING = {
   minStableHits: 2,
   maxMissed: 10,
   lockThreshold: 0.9,
+  /** Consecutive slot crops with same new label ≥ lockThreshold before auto-commit. */
+  slotAgreeFrames: 3,
 };
 
 // Client-side OpenCV multi-card path (contours + tracking). Re-enabled after abandoning the YOLO pipeline.
@@ -104,6 +108,39 @@ const hiLoDelta = (label) => {
   return HI_LO_VALUES[p.rank] ?? 0;
 };
 
+/** Returns { label, probability } when ready to auto-commit, else null. Mutates `ag` per side. */
+const trySlotClassifierAgreement = (ag, lastLabel, side, label, prob, threshold, needFrames) => {
+  const row = ag[side];
+  const last = lastLabel[side];
+  if (!label || !parseCardLabel(label)) {
+    row.streak = 0;
+    row.candidate = null;
+    return null;
+  }
+  if (prob < threshold) {
+    row.streak = 0;
+    row.candidate = null;
+    return null;
+  }
+  if (label === last) {
+    row.streak = 0;
+    row.candidate = null;
+    return null;
+  }
+  if (label !== row.candidate) {
+    row.candidate = label;
+    row.streak = 1;
+  } else {
+    row.streak += 1;
+  }
+  if (row.streak >= needFrames) {
+    row.streak = 0;
+    row.candidate = null;
+    return { label, probability: prob };
+  }
+  return null;
+};
+
 const currentRoundLeader = (dealer, player) => {
   const d = handSummary(dealer);
   const p = handSummary(player);
@@ -157,19 +194,11 @@ const suggestAction = ({ dealer, player, trueCount }) => {
 };
 
 function App() {
-  const [mode, setMode] = useState("upload");
-  const [file, setFile] = useState(null);
-  const [previewUrl, setPreviewUrl] = useState("");
-  const [topK, setTopK] = useState(3);
-  const [isLoading, setIsLoading] = useState(false);
   const [isCameraOn, setIsCameraOn] = useState(false);
   const [isLiveScanning, setIsLiveScanning] = useState(false);
-  const [scanIntervalMs, setScanIntervalMs] = useState(1200);
-  const [detectConf, setDetectConf] = useState(0.1);
-  const [cropPadding, setCropPadding] = useState(4);
-  const [multiCardMode, setMultiCardMode] = useState(ENABLE_OPENCV_MULTICARD);
+  const [detectConf] = useState(0.1);
+  const [cropPadding] = useState(4);
   const [opencvReady, setOpencvReady] = useState(false);
-  const [result, setResult] = useState(null);
   const [pipelineResult, setPipelineResult] = useState(null);
   const [pipelineFrameSize, setPipelineFrameSize] = useState(null);
   const [liveCards, setLiveCards] = useState([]);
@@ -177,7 +206,6 @@ function App() {
   /** Fixed dealer/player regions after first card each; OpenCV stops once both exist. */
   const [dealerSlot, setDealerSlot] = useState(null);
   const [playerSlot, setPlayerSlot] = useState(null);
-  const [slotArmed, setSlotArmed] = useState(null);
   const [slotPreview, setSlotPreview] = useState(emptySlotPreview);
 
   const [numDecks, setNumDecks] = useState(6);
@@ -188,7 +216,6 @@ function App() {
   const [committedDealer, setCommittedDealer] = useState([]);
   const [committedPlayer, setCommittedPlayer] = useState([]);
   const [tuning, setTuning] = useState(DEFAULT_TUNING);
-  const [showTuning, setShowTuning] = useState(false);
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -198,17 +225,17 @@ function App() {
   const inFlightRef = useRef(false);
   const tracksRef = useRef([]);
   const nextTrackIdRef = useRef(1);
-  const modeRef = useRef(mode);
-  const multiCardModeRef = useRef(multiCardMode);
   const opencvReadyRef = useRef(opencvReady);
   const dealerSlotRef = useRef(null);
   const playerSlotRef = useRef(null);
-  const slotArmedRef = useRef(null);
+  const lastCommittedSlotLabelRef = useRef({ dealer: null, player: null });
+  const slotAgreeRef = useRef({
+    dealer: { streak: 0, candidate: null },
+    player: { streak: 0, candidate: null },
+  });
   const nextHandCardIdRef = useRef(1);
   const discoveryAnchoredRef = useRef({ dealer: false, player: false });
   const tuningRef = useRef(DEFAULT_TUNING);
-
-  const hasFile = useMemo(() => Boolean(file), [file]);
 
   useEffect(() => {
     return () => {
@@ -221,16 +248,7 @@ function App() {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => track.stop());
       }
-      if (previewUrl) {
-        URL.revokeObjectURL(previewUrl);
-      }
     };
-  }, [previewUrl]);
-
-  useEffect(() => {
-    if (!ENABLE_OPENCV_MULTICARD) {
-      setMultiCardMode(false);
-    }
   }, []);
 
   useEffect(() => {
@@ -249,14 +267,6 @@ function App() {
   }, []);
 
   useEffect(() => {
-    modeRef.current = mode;
-  }, [mode]);
-
-  useEffect(() => {
-    multiCardModeRef.current = multiCardMode;
-  }, [multiCardMode]);
-
-  useEffect(() => {
     opencvReadyRef.current = opencvReady;
   }, [opencvReady]);
 
@@ -273,19 +283,13 @@ function App() {
   }, [playerSlot]);
 
   useEffect(() => {
-    slotArmedRef.current = slotArmed;
-  }, [slotArmed]);
-
-  useEffect(() => {
-    if (mode !== "live" && isCameraOn) {
-      stopCamera();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+    lastCommittedSlotLabelRef.current.dealer = committedDealer.at(-1)?.label ?? null;
+    lastCommittedSlotLabelRef.current.player = committedPlayer.at(-1)?.label ?? null;
+  }, [committedDealer, committedPlayer]);
 
   /** First card per side: OpenCV track locks → save fixed slot + commit (one card at a time per half). */
   useEffect(() => {
-    if (!ENABLE_OPENCV_MULTICARD || USE_PIPELINE || !multiCardMode) return;
+    if (!ENABLE_OPENCV_MULTICARD || USE_PIPELINE) return;
     if (dealerSlot && playerSlot) return;
     if (liveCards.length === 0) return;
 
@@ -327,10 +331,12 @@ function App() {
       dealerSlotRef.current = slot;
       setDealerSlot(slot);
       setCommittedDealer((prev) => [...prev, entry]);
+      lastCommittedSlotLabelRef.current.dealer = card.label;
     } else {
       playerSlotRef.current = slot;
       setPlayerSlot(slot);
       setCommittedPlayer((prev) => [...prev, entry]);
+      lastCommittedSlotLabelRef.current.player = card.label;
     }
     setRunningCount((v) => v + delta);
     setCardsSeen((v) => v + 1);
@@ -338,44 +344,13 @@ function App() {
     tracksRef.current = [];
     setLiveCards([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- drawCurrentFrameToCanvas is stable for this effect
-  }, [liveCards, dealerSlot, playerSlot, multiCardMode]);
+  }, [liveCards, dealerSlot, playerSlot]);
 
-  const onFileChange = (event) => {
-    const picked = event.target.files?.[0];
-    if (!picked) return;
-    if (previewUrl) {
-      URL.revokeObjectURL(previewUrl);
-    }
-    setFile(picked);
-    setResult(null);
-    setPipelineResult(null);
-    setError("");
-    setPreviewUrl(URL.createObjectURL(picked));
-  };
-
-  const toBase64 = (blob) =>
-    new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const full = String(reader.result || "");
-        const payload = full.includes(",") ? full.split(",")[1] : full;
-        resolve(payload);
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
-
-  const runPrediction = async (imageBase64, source = "upload", writeResult = true) => {
+  const runPrediction = async (imageBase64) => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
-    if (source === "upload") {
-      setIsLoading(true);
-    }
     try {
-      const data = await predictCard({ imageBase64, topK });
-      if (writeResult) {
-        setResult(data);
-      }
+      const data = await predictCard({ imageBase64, topK: LIVE_TOP_K });
       setError("");
       return data;
     } catch (err) {
@@ -383,9 +358,6 @@ function App() {
       setError(message);
       return null;
     } finally {
-      if (source === "upload") {
-        setIsLoading(false);
-      }
       inFlightRef.current = false;
     }
   };
@@ -406,17 +378,18 @@ function App() {
     }
   };
 
-  const runPipelinePrediction = async (imageBase64, source = "upload", frameSize = null) => {
+  const runPipelinePrediction = async (imageBase64, frameSize = null) => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
-    if (source === "upload") {
-      setIsLoading(true);
-    }
     try {
-      const data = await predictPipeline({ imageBase64, topK, detectConf, cropPadding });
+      const data = await predictPipeline({
+        imageBase64,
+        topK: LIVE_TOP_K,
+        detectConf,
+        cropPadding,
+      });
       setPipelineResult(data);
       setPipelineFrameSize(frameSize);
-      setResult(null);
       setError("");
       return data;
     } catch (err) {
@@ -424,34 +397,7 @@ function App() {
       setError(message);
       return null;
     } finally {
-      if (source === "upload") {
-        setIsLoading(false);
-      }
       inFlightRef.current = false;
-    }
-  };
-
-  const onSubmit = async (event) => {
-    event.preventDefault();
-    if (!file) {
-      setError("Please choose an image first.");
-      return;
-    }
-    setResult(null);
-    setPipelineResult(null);
-    setPipelineFrameSize(null);
-    setError("");
-    const imageBase64 = await toBase64(file);
-    if (USE_PIPELINE) {
-      const img = new Image();
-      const size = await new Promise((resolve) => {
-        img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
-        img.onerror = () => resolve(null);
-        img.src = `data:image/*;base64,${imageBase64}`;
-      });
-      await runPipelinePrediction(imageBase64, "upload", size);
-    } else {
-      await runPrediction(imageBase64, "upload");
     }
   };
 
@@ -466,20 +412,21 @@ function App() {
     nextTrackIdRef.current = 1;
     nextHandCardIdRef.current = 1;
     discoveryAnchoredRef.current = { dealer: false, player: false };
+    slotAgreeRef.current = {
+      dealer: { streak: 0, candidate: null },
+      player: { streak: 0, candidate: null },
+    };
     dealerSlotRef.current = null;
     playerSlotRef.current = null;
-    slotArmedRef.current = null;
     setLiveCards([]);
     setDealerSlot(null);
     setPlayerSlot(null);
-    setSlotArmed(null);
     setSlotPreview(emptySlotPreview());
     setCommittedDealer([]);
     setCommittedPlayer([]);
     setRunningCount(0);
     setCardsSeen(0);
     setRoundsWon({ player: 0, dealer: 0, push: 0 });
-    setResult(null);
     setError("");
   };
 
@@ -488,13 +435,15 @@ function App() {
     setRoundsWon((prev) => ({ ...prev, [who]: prev[who] + 1 }));
     tracksRef.current = [];
     discoveryAnchoredRef.current = { dealer: false, player: false };
+    slotAgreeRef.current = {
+      dealer: { streak: 0, candidate: null },
+      player: { streak: 0, candidate: null },
+    };
     dealerSlotRef.current = null;
     playerSlotRef.current = null;
-    slotArmedRef.current = null;
     setLiveCards([]);
     setDealerSlot(null);
     setPlayerSlot(null);
-    setSlotArmed(null);
     setSlotPreview(emptySlotPreview());
     setCommittedDealer([]);
     setCommittedPlayer([]);
@@ -518,7 +467,7 @@ function App() {
       }
       setIsCameraOn(true);
       setError("");
-      if (mode === "live" && ENABLE_OPENCV_MULTICARD) {
+      if (ENABLE_OPENCV_MULTICARD) {
         startDetectionLoop();
       }
     } catch (err) {
@@ -542,14 +491,15 @@ function App() {
     }
     resetLiveTrackingState();
     discoveryAnchoredRef.current = { dealer: false, player: false };
+    slotAgreeRef.current = {
+      dealer: { streak: 0, candidate: null },
+      player: { streak: 0, candidate: null },
+    };
     dealerSlotRef.current = null;
     playerSlotRef.current = null;
-    slotArmedRef.current = null;
     setDealerSlot(null);
     setPlayerSlot(null);
-    setSlotArmed(null);
     setSlotPreview(emptySlotPreview());
-    setResult(null);
     setPipelineResult(null);
     setPipelineFrameSize(null);
     setIsLiveScanning(false);
@@ -889,14 +839,7 @@ function App() {
       clearInterval(detectTimerRef.current);
     }
     detectTimerRef.current = setInterval(() => {
-      if (
-        !ENABLE_OPENCV_MULTICARD ||
-        !streamRef.current ||
-        modeRef.current !== "live" ||
-        !multiCardModeRef.current ||
-        !opencvReadyRef.current
-      )
-        return;
+      if (!ENABLE_OPENCV_MULTICARD || !streamRef.current || !opencvReadyRef.current) return;
       if (dealerSlotRef.current && playerSlotRef.current) return;
 
       const canvas = drawCurrentFrameToCanvas();
@@ -1011,53 +954,62 @@ function App() {
     }
     setIsLiveScanning(true);
     scanTimerRef.current = setInterval(async () => {
-      // Fixed slots: no full-frame search — classify only the armed slot after both anchors exist.
-      if (
-        ENABLE_OPENCV_MULTICARD &&
-        !USE_PIPELINE &&
-        mode === "live" &&
-        multiCardMode &&
-        opencvReady
-      ) {
+      // Fixed slots: classify both slot crops; auto-commit when classifier agrees across several scans.
+      if (ENABLE_OPENCV_MULTICARD && !USE_PIPELINE && opencvReady) {
         const canvas = drawCurrentFrameToCanvas();
         if (!canvas) return;
 
         if (dealerSlotRef.current && playerSlotRef.current) {
-          const armed = slotArmedRef.current;
-          if (armed && !inFlightRef.current) {
-            const slot = armed === "dealer" ? dealerSlotRef.current : playerSlotRef.current;
-            const imageBase64 = cropSlotToBase64(canvas, slot);
-            if (imageBase64) {
-              const data = await runPrediction(imageBase64, "live", false);
-              const top = data?.predictions?.[0]?.top_prediction;
-              const prob = top?.probability ?? 0;
-              const label = top?.label ?? "";
-              if (armed === "dealer") {
-                setSlotPreview((p) => ({ ...p, dealer: label ? { label, probability: prob } : null }));
-              } else {
-                setSlotPreview((p) => ({ ...p, player: label ? { label, probability: prob } : null }));
-              }
-              if (label && prob >= tuningRef.current.lockThreshold) {
+          const th = tuningRef.current.lockThreshold;
+          const need = Math.max(2, Math.round(tuningRef.current.slotAgreeFrames ?? 3));
+
+          if (!inFlightRef.current) {
+            const d64 = cropSlotToBase64(canvas, dealerSlotRef.current);
+            const p64 = cropSlotToBase64(canvas, playerSlotRef.current);
+            if (d64 && p64) {
+              const data = await runBatchPrediction([d64, p64]);
+              const preds = data?.predictions ?? [];
+              const dTop = preds[0]?.top_prediction;
+              const pTop = preds[1]?.top_prediction;
+              const dLabel = dTop?.label ?? "";
+              const dProb = dTop?.probability ?? 0;
+              const pLabel = pTop?.label ?? "";
+              const pProb = pTop?.probability ?? 0;
+
+              setSlotPreview({
+                dealer: dLabel ? { label: dLabel, probability: dProb } : null,
+                player: pLabel ? { label: pLabel, probability: pProb } : null,
+              });
+
+              const ag = slotAgreeRef.current;
+              const last = lastCommittedSlotLabelRef.current;
+              const dCommit = trySlotClassifierAgreement(ag, last, "dealer", dLabel, dProb, th, need);
+              const pCommit = trySlotClassifierAgreement(ag, last, "player", pLabel, pProb, th, need);
+
+              if (dCommit) {
                 const entry = {
                   id: nextHandCardIdRef.current++,
-                  label,
-                  probability: prob,
+                  label: dCommit.label,
+                  probability: dCommit.probability,
                 };
-                const delta = hiLoDelta(label);
-                if (armed === "dealer") {
-                  setCommittedDealer((prev) => [...prev, entry]);
-                } else {
-                  setCommittedPlayer((prev) => [...prev, entry]);
-                }
-                setRunningCount((v) => v + delta);
+                lastCommittedSlotLabelRef.current.dealer = dCommit.label;
+                setCommittedDealer((prev) => [...prev, entry]);
+                setRunningCount((v) => v + hiLoDelta(dCommit.label));
                 setCardsSeen((v) => v + 1);
-                slotArmedRef.current = null;
-                setSlotArmed(null);
-                setSlotPreview(emptySlotPreview());
+              }
+              if (pCommit) {
+                const entry = {
+                  id: nextHandCardIdRef.current++,
+                  label: pCommit.label,
+                  probability: pCommit.probability,
+                };
+                lastCommittedSlotLabelRef.current.player = pCommit.label;
+                setCommittedPlayer((prev) => [...prev, entry]);
+                setRunningCount((v) => v + hiLoDelta(pCommit.label));
+                setCardsSeen((v) => v + 1);
               }
             }
           }
-          setResult(null);
           return;
         }
 
@@ -1095,10 +1047,8 @@ function App() {
           }
         }
         if (activeTracks.length > 0) {
-          setResult(null);
           return;
         }
-        setResult(null);
         return;
       }
 
@@ -1108,14 +1058,14 @@ function App() {
       if (!imageBase64) return;
       resetLiveTrackingState();
       if (USE_PIPELINE) {
-        await runPipelinePrediction(imageBase64, "live", {
+        await runPipelinePrediction(imageBase64, {
           w: canvas.width,
           h: canvas.height,
         });
       } else {
-        await runPrediction(imageBase64, "live");
+        await runPrediction(imageBase64);
       }
-    }, Math.max(300, Number(scanIntervalMs) || 1200));
+    }, LIVE_SCAN_INTERVAL_MS);
   };
 
   const stopLiveScan = () => {
@@ -1123,9 +1073,11 @@ function App() {
       clearInterval(scanTimerRef.current);
       scanTimerRef.current = null;
     }
-    slotArmedRef.current = null;
-    setSlotArmed(null);
     setSlotPreview(emptySlotPreview());
+    slotAgreeRef.current = {
+      dealer: { streak: 0, candidate: null },
+      player: { streak: 0, candidate: null },
+    };
     setIsLiveScanning(false);
   };
 
@@ -1136,406 +1088,92 @@ function App() {
 
         <section className="panel">
           <h1>Blackjack Card Classifier</h1>
-            <p className="muted">
-            Switch between upload and live camera mode. Frames are sent to API Gateway and scored by SageMaker.
-            {USE_PIPELINE && " Pipeline mode uses detect → classify when VITE_PIPELINE_PATH is set."}
-            {!USE_PIPELINE &&
-              ENABLE_OPENCV_MULTICARD &&
-              " Live OpenCV mode uses one fixed slot per side after the first card is found in each half of the frame."}
-            </p>
-            <p className="muted small">
-              Build-time routes: classifier{" "}
-              <code>{import.meta.env.VITE_PREDICT_PATH ?? "/predict"}</code>
-              {" · "}
-              pipeline{" "}
-              <code>
-                {(import.meta.env.VITE_PIPELINE_PATH ?? "").trim() || "(empty — add to .env.production and rebuild)"}
-              </code>
-            </p>
-          <div className="modeToggle">
-            <button
-              type="button"
-              className={mode === "upload" ? "modeBtn activeMode" : "modeBtn"}
-              onClick={() => setMode("upload")}
-            >
-              Upload
-            </button>
-            <button
-              type="button"
-              className={mode === "live" ? "modeBtn activeMode" : "modeBtn"}
-              onClick={() => setMode("live")}
-            >
-              Live Camera
-            </button>
-          </div>
+          <p className="muted">
+            Live camera only. Dealer uses the upper half of the frame, player the lower half. After each side&apos;s
+            first card, new cards are added when the model agrees on the same new label for several scans in a row.
+          </p>
 
-          {mode === "upload" && (
-            <form onSubmit={onSubmit} className="form">
-              <label className="label">Card image</label>
-              <input type="file" accept="image/*" onChange={onFileChange} />
-
-              <label className="label">Top K predictions</label>
-              <input
-                type="number"
-                min={1}
-                max={10}
-                value={topK}
-                onChange={(e) => setTopK(Number(e.target.value || 1))}
-              />
-
-              <button type="submit" disabled={!hasFile || isLoading}>
-                {isLoading ? "Predicting..." : "Predict Card"}
-              </button>
-            </form>
-          )}
-
-          {mode === "live" && (
-            <div className="form">
-              <label className="label">Top K predictions</label>
-              <input
-                type="number"
-                min={1}
-                max={10}
-                value={topK}
-                onChange={(e) => setTopK(Number(e.target.value || 1))}
-              />
-
-              <label className="label">Scan interval (ms)</label>
-              <input
-                type="number"
-                min={300}
-                max={5000}
-                value={scanIntervalMs}
-                onChange={(e) => setScanIntervalMs(Number(e.target.value || 1200))}
-              />
-
-              {USE_PIPELINE && (
-                <>
-                  <label className="label">
-                    Detector confidence: {detectConf.toFixed(2)}
-                  </label>
-                  <input
-                    type="range"
-                    min={0.05}
-                    max={0.9}
-                    step={0.05}
-                    value={detectConf}
-                    onChange={(e) => setDetectConf(Number(e.target.value))}
-                  />
-
-                  <label className="label">
-                    Crop padding around detection: {cropPadding.toFixed(1)}x
-                  </label>
-                  <input
-                    type="range"
-                    min={0}
-                    max={10}
-                    step={0.5}
-                    value={cropPadding}
-                    onChange={(e) => setCropPadding(Number(e.target.value))}
-                  />
-                  <p className="muted small">
-                    Detector boxes here are the card&apos;s corner index. Pad each detection by this factor of its size before
-                    classifying (e.g. 4x = the crop becomes ~9× the detected box). Increase if the classifier sees only corners.
-                  </p>
-                </>
-              )}
-
-              <label className={`checkRow${!ENABLE_OPENCV_MULTICARD ? " muted" : ""}`}>
-                <input
-                  type="checkbox"
-                  checked={multiCardMode}
-                  disabled={!ENABLE_OPENCV_MULTICARD}
-                  onChange={(e) => {
-                    setMultiCardMode(e.target.checked);
-                    resetLiveTrackingState();
-                    discoveryAnchoredRef.current = { dealer: false, player: false };
-                    dealerSlotRef.current = null;
-                    playerSlotRef.current = null;
-                    slotArmedRef.current = null;
-                    setDealerSlot(null);
-                    setPlayerSlot(null);
-                    setSlotArmed(null);
-                    setSlotPreview(emptySlotPreview());
-                  }}
-                />
-                Dealer / player slots (OpenCV finds the first card each; same spot for later cards)
-                {!ENABLE_OPENCV_MULTICARD && " — off (use server pipeline / YOLO). Enable in code: ENABLE_OPENCV_MULTICARD."}
-              </label>
-
-              <label className="label">Decks in shoe</label>
-              <select
-                value={numDecks}
-                onChange={(e) => setNumDecks(Number(e.target.value))}
+          <div className="form">
+            <label className="label">Classifier confidence: {tuning.lockThreshold.toFixed(2)}</label>
+            <input
+              type="range"
+              min={0.5}
+              max={0.99}
+              step={0.01}
+              value={tuning.lockThreshold}
+              onChange={(e) =>
+                setTuning((t) => ({ ...t, lockThreshold: Number(e.target.value) }))
+              }
+            />
+            <div className="buttonRow" style={{ marginTop: "0.35rem" }}>
+              <button
+                type="button"
+                onClick={() =>
+                  setTuning((t) => ({ ...t, lockThreshold: DEFAULT_TUNING.lockThreshold }))
+                }
               >
-                <option value={1}>1</option>
-                <option value={2}>2</option>
-                <option value={4}>4</option>
-                <option value={6}>6</option>
-                <option value={8}>8</option>
-              </select>
+                Reset confidence to default
+              </button>
+            </div>
+            <p className="muted small">
+              Higher values mean the model must be more sure before locking or auto-adding a card from a slot.
+            </p>
 
-              <label className="label">
-                Cards burned / thrown out at shuffle: {burnedCards}
-              </label>
-              <input
-                type="number"
-                min={0}
-                max={52}
-                step={1}
-                value={burnedCards}
-                onChange={(e) => setBurnedCards(Math.max(0, Number(e.target.value) || 0))}
-              />
-              <p className="muted small">
-                In most casinos the dealer burns 1 card after a shuffle, and sometimes more are discarded. Those cards
-                are not visible but are gone from the shoe.
-              </p>
+            <label className="label">Decks in shoe</label>
+            <select value={numDecks} onChange={(e) => setNumDecks(Number(e.target.value))}>
+              <option value={1}>1</option>
+              <option value={2}>2</option>
+              <option value={4}>4</option>
+              <option value={6}>6</option>
+              <option value={8}>8</option>
+            </select>
 
-              {!USE_PIPELINE && (
-                <p className="muted small" style={{ marginTop: "0.75rem", maxWidth: "42rem" }}>
-                  <strong>Note:</strong> Without <code>VITE_PIPELINE_PATH</code>, live mode sends the{" "}
-                  <em>entire</em> camera frame to the classifier. The model was trained on{" "}
-                  <em>tight card crops</em>, so distant table shots often look like random suits (e.g. J♠ vs J♣) with
-                  low confidence. Fix: add <code>VITE_PIPELINE_PATH=/predict-pipeline</code> in{" "}
-                  <code>frontend/.env</code> (YOLO crop → classify), or zoom so the card fills most of the frame, or
-                  use <strong>Upload</strong> with a close-up photo.
-                </p>
-              )}
-              {USE_PIPELINE && (
-                <p className="muted small" style={{ marginTop: "0.75rem" }}>
-                  Pipeline mode: each frame is sent to <code>/predict-pipeline</code> (detect boxes, then classify each
-                  crop).
-                </p>
-              )}
+            <label className="label">Cards burned / thrown out at shuffle: {burnedCards}</label>
+            <input
+              type="number"
+              min={0}
+              max={52}
+              step={1}
+              value={burnedCards}
+              onChange={(e) => setBurnedCards(Math.max(0, Number(e.target.value) || 0))}
+            />
+            <p className="muted small">
+              In most casinos the dealer burns 1 card after a shuffle, and sometimes more are discarded. Those cards
+              are not visible but are gone from the shoe.
+            </p>
 
-              {ENABLE_OPENCV_MULTICARD && (
-                <details
-                  open={showTuning}
-                  onToggle={(e) => setShowTuning(e.currentTarget.open)}
-                  style={{ marginTop: "0.75rem" }}
-                >
-                  <summary style={{ cursor: "pointer" }}>
-                    <strong>Detector tuning (advanced)</strong>
-                  </summary>
-                  <p className="muted small">
-                    Change one value at a time. Effects are live; no restart needed.
-                  </p>
-
-                  <label className="label">
-                    Lock threshold (classifier confidence): {tuning.lockThreshold.toFixed(2)}
-                  </label>
-                  <input
-                    type="range"
-                    min={0.5}
-                    max={0.99}
-                    step={0.01}
-                    value={tuning.lockThreshold}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, lockThreshold: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    Min card area (% of frame): {(tuning.cardMinAreaFrac * 100).toFixed(2)}%
-                  </label>
-                  <input
-                    type="range"
-                    min={0.0005}
-                    max={0.05}
-                    step={0.0005}
-                    value={tuning.cardMinAreaFrac}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, cardMinAreaFrac: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    Max card area (% of frame): {(tuning.cardMaxAreaFrac * 100).toFixed(0)}%
-                  </label>
-                  <input
-                    type="range"
-                    min={0.1}
-                    max={0.9}
-                    step={0.05}
-                    value={tuning.cardMaxAreaFrac}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, cardMaxAreaFrac: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    Aspect ratio min (height/width): {tuning.cardRatioMin.toFixed(2)}
-                  </label>
-                  <input
-                    type="range"
-                    min={1.0}
-                    max={1.5}
-                    step={0.05}
-                    value={tuning.cardRatioMin}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, cardRatioMin: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    Aspect ratio max (height/width): {tuning.cardRatioMax.toFixed(2)}
-                  </label>
-                  <input
-                    type="range"
-                    min={1.5}
-                    max={3.0}
-                    step={0.05}
-                    value={tuning.cardRatioMax}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, cardRatioMax: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    Min extent (contour fill of its bbox): {tuning.cardMinExtent.toFixed(2)}
-                  </label>
-                  <input
-                    type="range"
-                    min={0.3}
-                    max={0.95}
-                    step={0.01}
-                    value={tuning.cardMinExtent}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, cardMinExtent: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    Canny low threshold: {tuning.cannyLow}
-                  </label>
-                  <input
-                    type="range"
-                    min={5}
-                    max={100}
-                    step={1}
-                    value={tuning.cannyLow}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, cannyLow: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    Canny high threshold: {tuning.cannyHigh}
-                  </label>
-                  <input
-                    type="range"
-                    min={30}
-                    max={250}
-                    step={1}
-                    value={tuning.cannyHigh}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, cannyHigh: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    NMS IoU threshold: {tuning.nmsIou.toFixed(2)}
-                  </label>
-                  <input
-                    type="range"
-                    min={0.1}
-                    max={0.8}
-                    step={0.05}
-                    value={tuning.nmsIou}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, nmsIou: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    Track smoothing alpha: {tuning.trackSmoothing.toFixed(2)}
-                  </label>
-                  <input
-                    type="range"
-                    min={0.1}
-                    max={1.0}
-                    step={0.05}
-                    value={tuning.trackSmoothing}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, trackSmoothing: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    Min stable hits before showing: {tuning.minStableHits}
-                  </label>
-                  <input
-                    type="range"
-                    min={1}
-                    max={8}
-                    step={1}
-                    value={tuning.minStableHits}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, minStableHits: Number(e.target.value) }))
-                    }
-                  />
-
-                  <label className="label">
-                    Max missed detections before drop: {tuning.maxMissed}
-                  </label>
-                  <input
-                    type="range"
-                    min={2}
-                    max={40}
-                    step={1}
-                    value={tuning.maxMissed}
-                    onChange={(e) =>
-                      setTuning((t) => ({ ...t, maxMissed: Number(e.target.value) }))
-                    }
-                  />
-
-                  <div className="buttonRow">
-                    <button type="button" onClick={() => setTuning(DEFAULT_TUNING)}>
-                      Reset tuning to defaults
-                    </button>
-                  </div>
-                </details>
+            <div className="buttonRow" style={{ marginTop: "0.75rem" }}>
+              {!isCameraOn ? (
+                <button type="button" onClick={startCamera}>
+                  Start Camera
+                </button>
+              ) : (
+                <button type="button" onClick={stopCamera}>
+                  Stop Camera
+                </button>
               )}
 
-              <div className="buttonRow">
-                {!isCameraOn ? (
-                  <button type="button" onClick={startCamera}>
-                    Start Camera
-                  </button>
-                ) : (
-                  <button type="button" onClick={stopCamera}>
-                    Stop Camera
-                  </button>
-                )}
-
-                {!isLiveScanning ? (
-                  <button type="button" disabled={!isCameraOn} onClick={startLiveScan}>
-                    Start Live Scan
-                  </button>
-                ) : (
-                  <button type="button" onClick={stopLiveScan}>
-                    Stop Live Scan
-                  </button>
-                )}
-              </div>
-
-              <p className="muted small">
-                Camera: {isCameraOn ? "On" : "Off"} | Live scan: {isLiveScanning ? "Running" : "Stopped"}
-              </p>
-              {ENABLE_OPENCV_MULTICARD && (
-                <p className="muted small">OpenCV detector: {opencvReady ? "Ready" : "Loading..."}</p>
+              {!isLiveScanning ? (
+                <button type="button" disabled={!isCameraOn} onClick={startLiveScan}>
+                  Start Live Scan
+                </button>
+              ) : (
+                <button type="button" onClick={stopLiveScan}>
+                  Stop Live Scan
+                </button>
               )}
             </div>
-          )}
+
+            <p className="muted small">
+              Camera: {isCameraOn ? "On" : "Off"} | Live scan: {isLiveScanning ? "Running" : "Stopped"}
+            </p>
+          </div>
         </section>
 
         <section className="grid">
           <article className="panel">
-            <h2>{mode === "live" ? "Live Preview" : "Image Preview"}</h2>
-            {mode === "upload" && !previewUrl && <p className="muted">No image selected.</p>}
-            {mode === "upload" && previewUrl && <img className="preview" src={previewUrl} alt="Uploaded card preview" />}
-            {mode === "live" && (
-              <div className="liveContainer">
+            <h2>Table view</h2>
+            <div className="liveContainer">
                 <video ref={videoRef} className="preview livePreview" autoPlay playsInline muted />
                 <canvas ref={canvasRef} className="hiddenCanvas" />
                 <div className="tableDivider" />
@@ -1647,7 +1285,6 @@ function App() {
                       });
                   })()}
               </div>
-            )}
           </article>
 
           <article className="panel">
@@ -1663,11 +1300,7 @@ function App() {
                 const centerY = (card.ny ?? 0) + (card.nh ?? 0) / 2;
                 (centerY < 0.5 ? scanningDealer : scanningPlayer).push(card);
               }
-              const slotMode =
-                mode === "live" &&
-                ENABLE_OPENCV_MULTICARD &&
-                multiCardMode &&
-                !USE_PIPELINE;
+              const slotMode = ENABLE_OPENCV_MULTICARD && !USE_PIPELINE;
               const leader = currentRoundLeader(dealerCards, playerCards);
               const decksRemaining = Math.max(
                 0.25,
@@ -1726,7 +1359,7 @@ function App() {
                 if (!playerSlot) {
                   return "Dealer slot is set. Hold one player card in the lower half until it locks.";
                 }
-                return "Slots are fixed. Put the next card in the correct slot, then tap Scan for that side. Only that crop is sent to the classifier (no OpenCV search).";
+                return `Slots are fixed. Place the next card in a slot; when the model holds the same new card above the lock threshold for ${Math.max(2, Math.round(tuning.slotAgreeFrames ?? 3))} scans in a row (and it is not the same as the last card in that hand), it is added automatically.`;
               })();
 
               return (
@@ -1736,42 +1369,9 @@ function App() {
                       <h3>Live scan steps</h3>
                       <p className="muted small">{slotPrompt}</p>
                       {dealerSlot && playerSlot && (
-                        <div className="buttonRow" style={{ marginTop: "0.5rem" }}>
-                          <button
-                            type="button"
-                            disabled={Boolean(slotArmed)}
-                            onClick={() => {
-                              slotArmedRef.current = "dealer";
-                              setSlotArmed("dealer");
-                              setSlotPreview((p) => ({ ...p, dealer: null }));
-                            }}
-                          >
-                            Scan dealer slot
-                          </button>
-                          <button
-                            type="button"
-                            disabled={Boolean(slotArmed)}
-                            onClick={() => {
-                              slotArmedRef.current = "player";
-                              setSlotArmed("player");
-                              setSlotPreview((p) => ({ ...p, player: null }));
-                            }}
-                          >
-                            Scan player slot
-                          </button>
-                          {slotArmed && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                slotArmedRef.current = null;
-                                setSlotArmed(null);
-                                setSlotPreview(emptySlotPreview());
-                              }}
-                            >
-                              Cancel scan
-                            </button>
-                          )}
-                        </div>
+                        <p className="muted small" style={{ marginTop: "0.35rem" }}>
+                          The table view shows each slot&apos;s current readout each scan.
+                        </p>
                       )}
                     </div>
                   )}
@@ -1853,11 +1453,6 @@ function App() {
                     </p>
                   </div>
 
-                  {mode === "live" && result?.endpoint && (
-                    <p className="muted small">
-                      Endpoint: <code>{result.endpoint}</code>
-                    </p>
-                  )}
                 </div>
               );
             })()}
@@ -1876,38 +1471,6 @@ function App() {
                   !(pipelineResult.detections?.length > 0) && (
                     <p className="muted">Pipeline returned no detections.</p>
                   )}
-                <details style={{ marginTop: "0.75rem" }}>
-                  <summary className="muted small" style={{ cursor: "pointer" }}>
-                    Debug: raw pipeline response
-                  </summary>
-                  <pre
-                    className="muted small"
-                    style={{
-                      whiteSpace: "pre-wrap",
-                      wordBreak: "break-word",
-                      maxHeight: "260px",
-                      overflow: "auto",
-                      background: "rgba(255,255,255,0.04)",
-                      padding: "0.5rem",
-                      borderRadius: "6px",
-                    }}
-                  >
-                    {JSON.stringify(
-                      {
-                        detector_endpoint: pipelineResult.detector_endpoint,
-                        classifier_endpoint: pipelineResult.classifier_endpoint,
-                        detections_count: pipelineResult.detections?.length ?? 0,
-                        cards_count: pipelineResult.cards?.length ?? 0,
-                        detections: (pipelineResult.detections ?? []).slice(0, 8),
-                        message: pipelineResult.message,
-                        frame_size: pipelineFrameSize,
-                        detect_conf_sent: detectConf,
-                      },
-                      null,
-                      2
-                    )}
-                  </pre>
-                </details>
                 {pipelineResult.cards?.length > 0 && (
                   <ul>
                     {pipelineResult.cards.map((card, idx) => {
@@ -1945,19 +1508,6 @@ function App() {
                         Classifier: <code>{pipelineResult.classifier_endpoint}</code>
                       </>
                     )}
-                  </p>
-                )}
-              </div>
-            )}
-            {result?.predictions?.[0] && (
-              <div>
-                <p>
-                  <strong>Top:</strong> {result.predictions[0].top_prediction.label} (
-                  {(result.predictions[0].top_prediction.probability * 100).toFixed(2)}%)
-                </p>
-                {result.endpoint && (
-                  <p className="muted small">
-                    Endpoint: <code>{result.endpoint}</code>
                   </p>
                 )}
               </div>
