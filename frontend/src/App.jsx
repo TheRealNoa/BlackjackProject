@@ -36,7 +36,7 @@ const DEFAULT_TUNING = {
   trackSmoothing: 0.35,
   minStableHits: 2,
   maxMissed: 10,
-  lockThreshold: 0.9,
+  lockThreshold: 0.52,
   /** Consecutive slot crops with same new label ≥ lockThreshold before auto-commit. */
   slotAgreeFrames: 3,
 };
@@ -216,7 +216,7 @@ function App() {
   const [roundsWon, setRoundsWon] = useState({ player: 0, dealer: 0, push: 0 });
   const [committedDealer, setCommittedDealer] = useState([]);
   const [committedPlayer, setCommittedPlayer] = useState([]);
-  const [tuning, setTuning] = useState(DEFAULT_TUNING);
+  const [tuning] = useState(DEFAULT_TUNING);
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -1096,31 +1096,6 @@ function App() {
           </p>
 
           <div className="form">
-            <label className="label">Classifier confidence: {tuning.lockThreshold.toFixed(2)}</label>
-            <input
-              type="range"
-              min={0.5}
-              max={0.99}
-              step={0.01}
-              value={tuning.lockThreshold}
-              onChange={(e) =>
-                setTuning((t) => ({ ...t, lockThreshold: Number(e.target.value) }))
-              }
-            />
-            <div className="buttonRow" style={{ marginTop: "0.35rem" }}>
-              <button
-                type="button"
-                onClick={() =>
-                  setTuning((t) => ({ ...t, lockThreshold: DEFAULT_TUNING.lockThreshold }))
-                }
-              >
-                Reset confidence to default
-              </button>
-            </div>
-            <p className="muted small">
-              Higher values mean the model must be more sure before locking or auto-adding a card from a slot.
-            </p>
-
             <label className="label">Decks in shoe</label>
             <select value={numDecks} onChange={(e) => setNumDecks(Number(e.target.value))}>
               <option value={1}>1</option>
@@ -1361,7 +1336,7 @@ function App() {
                 if (!playerSlot) {
                   return "Dealer slot is set. Hold one player card in the lower half until it locks.";
                 }
-                return `Slots are fixed. Place the next card in a slot; when the model holds the same new card above the lock threshold for ${Math.max(2, Math.round(tuning.slotAgreeFrames ?? 3))} scans in a row (and it is not the same as the last card in that hand), it is added automatically.`;
+                return `Slots are fixed. Place the next card in a slot; when the model holds the same new card at ≥${Math.round(tuning.lockThreshold * 100)}% confidence for ${Math.max(2, Math.round(tuning.slotAgreeFrames ?? 3))} scans in a row (and it is not the same as the last card in that hand), it is added automatically.`;
               })();
 
               return (
