@@ -4,7 +4,6 @@ import { predictCard, predictCards, predictPipeline } from "./services/api";
 
 const USE_PIPELINE = Boolean((import.meta.env.VITE_PIPELINE_PATH ?? "").trim());
 
-const LOCK_THRESHOLD = 0.9;
 const TRACK_TTL_MS = 3500;
 const DETECT_INTERVAL_MS = 250;
 const CAMERA_REQUEST_WIDTH = 960;
@@ -13,22 +12,29 @@ const CAMERA_REQUEST_FPS = 30;
 const PROCESS_MAX_WIDTH = 480;
 const CARD_WARP_WIDTH = 200;
 const CARD_WARP_HEIGHT = 300;
-const CARD_RATIO_MIN = 1.2;
-const CARD_RATIO_MAX = 2.0;
-const CARD_MIN_EXTENT = 0.65;
-const CARD_MIN_AREA_FRAC = 0.003;
-const CARD_MAX_AREA_FRAC = 0.55;
-const CANNY_LOW = 30;
-const CANNY_HIGH = 100;
-const NMS_IOU_THRESHOLD = 0.4;
 const TRACK_IOU_MATCH = 0.25;
 const TRACK_CENTER_MATCH = 0.16;
-const TRACK_SMOOTHING_ALPHA = 0.35;
-const MIN_STABLE_HITS = 2;
-const MAX_MISSED_DETECTIONS = 10;
 const ACTIVE_TRACK_WINDOW_MS = 1500;
 const STICKY_CONFIRMED_TRACKS = true;
 const STICKY_MAX_IDLE_MS = 12000;
+
+/** Normalized fixed crop region (first locked card) + optional quad for warp. */
+const emptySlotPreview = () => ({ dealer: null, player: null });
+
+const DEFAULT_TUNING = {
+  cardRatioMin: 1.2,
+  cardRatioMax: 2.0,
+  cardMinExtent: 0.65,
+  cardMinAreaFrac: 0.003,
+  cardMaxAreaFrac: 0.55,
+  cannyLow: 30,
+  cannyHigh: 100,
+  nmsIou: 0.4,
+  trackSmoothing: 0.35,
+  minStableHits: 2,
+  maxMissed: 10,
+  lockThreshold: 0.9,
+};
 
 // Client-side OpenCV multi-card path (contours + tracking). Re-enabled after abandoning the YOLO pipeline.
 const ENABLE_OPENCV_MULTICARD = true;
@@ -86,6 +92,70 @@ const handSummary = (cards) => {
   return { total, status: "ok" };
 };
 
+const HI_LO_VALUES = {
+  two: 1, three: 1, four: 1, five: 1, six: 1,
+  seven: 0, eight: 0, nine: 0,
+  ten: -1, jack: -1, queen: -1, king: -1, ace: -1,
+};
+
+const hiLoDelta = (label) => {
+  const p = parseCardLabel(label);
+  if (!p) return 0;
+  return HI_LO_VALUES[p.rank] ?? 0;
+};
+
+const currentRoundLeader = (dealer, player) => {
+  const d = handSummary(dealer);
+  const p = handSummary(player);
+  if (p.status === "bust" && d.status === "bust") return "dealer";
+  if (p.status === "bust") return "dealer";
+  if (d.status === "bust") return "player";
+  if (p.status === "empty" && d.status === "empty") return null;
+  if (p.total > d.total) return "player";
+  if (d.total > p.total) return "dealer";
+  if (p.total === 0) return null;
+  return "push";
+};
+
+const suggestAction = ({ dealer, player, trueCount }) => {
+  if (player.length === 0) return "Waiting for player cards";
+  const playerSummary = handSummary(player);
+  if (playerSummary.status === "bust") return "Busted — round over";
+  if (playerSummary.status === "blackjack") return "Blackjack — stand";
+  const dealerUp = dealer.find((c) => parseCardLabel(c.label));
+  const dealerRank = dealerUp ? parseCardLabel(dealerUp.label)?.rank : null;
+  const dealerVal = dealerRank ? RANK_VALUES[dealerRank] : null;
+  const total = playerSummary.total;
+
+  // Simple basic strategy, with a few count-based deviations.
+  if (total <= 8) return "Hit";
+  if (total === 9) {
+    if (dealerVal && dealerVal >= 3 && dealerVal <= 6) return "Double (or hit)";
+    return "Hit";
+  }
+  if (total === 10 || total === 11) {
+    if (!dealerVal) return "Hit";
+    if (total === 11 && dealerVal >= 2 && dealerVal <= 10) return "Double (or hit)";
+    if (total === 10 && dealerVal >= 2 && dealerVal <= 9) return "Double (or hit)";
+    return "Hit";
+  }
+  if (total === 12) {
+    if (!dealerVal) return "Hit";
+    if (dealerVal >= 4 && dealerVal <= 6) return "Stand";
+    if (trueCount >= 3 && dealerVal === 2) return "Stand (+3 deviation)";
+    if (trueCount >= 2 && dealerVal === 3) return "Stand (+2 deviation)";
+    return "Hit";
+  }
+  if (total >= 13 && total <= 16) {
+    if (!dealerVal) return "Hit";
+    if (dealerVal >= 2 && dealerVal <= 6) return "Stand";
+    if (total === 16 && dealerVal === 10 && trueCount >= 0) return "Stand (Illustrious 18)";
+    if (total === 15 && dealerVal === 10 && trueCount >= 4) return "Stand (deviation)";
+    return "Hit";
+  }
+  return "Stand";
+};
+
 function App() {
   const [mode, setMode] = useState("upload");
   const [file, setFile] = useState(null);
@@ -104,6 +174,21 @@ function App() {
   const [pipelineFrameSize, setPipelineFrameSize] = useState(null);
   const [liveCards, setLiveCards] = useState([]);
   const [error, setError] = useState("");
+  /** Fixed dealer/player regions after first card each; OpenCV stops once both exist. */
+  const [dealerSlot, setDealerSlot] = useState(null);
+  const [playerSlot, setPlayerSlot] = useState(null);
+  const [slotArmed, setSlotArmed] = useState(null);
+  const [slotPreview, setSlotPreview] = useState(emptySlotPreview);
+
+  const [numDecks, setNumDecks] = useState(6);
+  const [burnedCards, setBurnedCards] = useState(1);
+  const [runningCount, setRunningCount] = useState(0);
+  const [cardsSeen, setCardsSeen] = useState(0);
+  const [roundsWon, setRoundsWon] = useState({ player: 0, dealer: 0, push: 0 });
+  const [committedDealer, setCommittedDealer] = useState([]);
+  const [committedPlayer, setCommittedPlayer] = useState([]);
+  const [tuning, setTuning] = useState(DEFAULT_TUNING);
+  const [showTuning, setShowTuning] = useState(false);
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -116,6 +201,12 @@ function App() {
   const modeRef = useRef(mode);
   const multiCardModeRef = useRef(multiCardMode);
   const opencvReadyRef = useRef(opencvReady);
+  const dealerSlotRef = useRef(null);
+  const playerSlotRef = useRef(null);
+  const slotArmedRef = useRef(null);
+  const nextHandCardIdRef = useRef(1);
+  const discoveryAnchoredRef = useRef({ dealer: false, player: false });
+  const tuningRef = useRef(DEFAULT_TUNING);
 
   const hasFile = useMemo(() => Boolean(file), [file]);
 
@@ -170,11 +261,84 @@ function App() {
   }, [opencvReady]);
 
   useEffect(() => {
+    tuningRef.current = tuning;
+  }, [tuning]);
+
+  useEffect(() => {
+    dealerSlotRef.current = dealerSlot;
+  }, [dealerSlot]);
+
+  useEffect(() => {
+    playerSlotRef.current = playerSlot;
+  }, [playerSlot]);
+
+  useEffect(() => {
+    slotArmedRef.current = slotArmed;
+  }, [slotArmed]);
+
+  useEffect(() => {
     if (mode !== "live" && isCameraOn) {
       stopCamera();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
+
+  /** First card per side: OpenCV track locks → save fixed slot + commit (one card at a time per half). */
+  useEffect(() => {
+    if (!ENABLE_OPENCV_MULTICARD || USE_PIPELINE || !multiCardMode) return;
+    if (dealerSlot && playerSlot) return;
+    if (liveCards.length === 0) return;
+
+    const locked = liveCards.filter((c) => c.label && c.locked);
+    const card = !dealerSlot
+      ? locked.find((c) => (c.ny ?? 0) + (c.nh ?? 0) / 2 < 0.5)
+      : !playerSlot
+        ? locked.find((c) => (c.ny ?? 0) + (c.nh ?? 0) / 2 >= 0.5)
+        : null;
+    if (!card) return;
+
+    const canvas = drawCurrentFrameToCanvas();
+    if (!canvas) return;
+
+    const anchorKey = !dealerSlot ? "dealer" : "player";
+    if (discoveryAnchoredRef.current[anchorKey]) return;
+    discoveryAnchoredRef.current[anchorKey] = true;
+    const cw = canvas.width;
+    const ch = canvas.height;
+    const cornersNorm =
+      card.corners && card.corners.length === 4
+        ? card.corners.map((p) => ({ nx: p.x / cw, ny: p.y / ch }))
+        : null;
+    const slot = {
+      nx: card.nx,
+      ny: card.ny,
+      nw: card.nw,
+      nh: card.nh,
+      cornersNorm,
+    };
+    const entry = {
+      id: nextHandCardIdRef.current++,
+      label: card.label,
+      probability: card.probability ?? 0,
+    };
+    const delta = hiLoDelta(card.label);
+
+    if (!dealerSlot) {
+      dealerSlotRef.current = slot;
+      setDealerSlot(slot);
+      setCommittedDealer((prev) => [...prev, entry]);
+    } else {
+      playerSlotRef.current = slot;
+      setPlayerSlot(slot);
+      setCommittedPlayer((prev) => [...prev, entry]);
+    }
+    setRunningCount((v) => v + delta);
+    setCardsSeen((v) => v + 1);
+
+    tracksRef.current = [];
+    setLiveCards([]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- drawCurrentFrameToCanvas is stable for this effect
+  }, [liveCards, dealerSlot, playerSlot, multiCardMode]);
 
   const onFileChange = (event) => {
     const picked = event.target.files?.[0];
@@ -293,8 +457,47 @@ function App() {
 
   const resetLiveTrackingState = () => {
     tracksRef.current = [];
-    nextTrackIdRef.current = 1;
+    // Keep nextTrackIdRef monotonic across camera restarts (tracks only reset here).
     setLiveCards([]);
+  };
+
+  const resetAll = () => {
+    tracksRef.current = [];
+    nextTrackIdRef.current = 1;
+    nextHandCardIdRef.current = 1;
+    discoveryAnchoredRef.current = { dealer: false, player: false };
+    dealerSlotRef.current = null;
+    playerSlotRef.current = null;
+    slotArmedRef.current = null;
+    setLiveCards([]);
+    setDealerSlot(null);
+    setPlayerSlot(null);
+    setSlotArmed(null);
+    setSlotPreview(emptySlotPreview());
+    setCommittedDealer([]);
+    setCommittedPlayer([]);
+    setRunningCount(0);
+    setCardsSeen(0);
+    setRoundsWon({ player: 0, dealer: 0, push: 0 });
+    setResult(null);
+    setError("");
+  };
+
+  const recordRoundWinner = (who) => {
+    if (who !== "player" && who !== "dealer" && who !== "push") return;
+    setRoundsWon((prev) => ({ ...prev, [who]: prev[who] + 1 }));
+    tracksRef.current = [];
+    discoveryAnchoredRef.current = { dealer: false, player: false };
+    dealerSlotRef.current = null;
+    playerSlotRef.current = null;
+    slotArmedRef.current = null;
+    setLiveCards([]);
+    setDealerSlot(null);
+    setPlayerSlot(null);
+    setSlotArmed(null);
+    setSlotPreview(emptySlotPreview());
+    setCommittedDealer([]);
+    setCommittedPlayer([]);
   };
 
   const startCamera = async () => {
@@ -338,6 +541,14 @@ function App() {
       videoRef.current.srcObject = null;
     }
     resetLiveTrackingState();
+    discoveryAnchoredRef.current = { dealer: false, player: false };
+    dealerSlotRef.current = null;
+    playerSlotRef.current = null;
+    slotArmedRef.current = null;
+    setDealerSlot(null);
+    setPlayerSlot(null);
+    setSlotArmed(null);
+    setSlotPreview(emptySlotPreview());
     setResult(null);
     setPipelineResult(null);
     setPipelineFrameSize(null);
@@ -434,7 +645,7 @@ function App() {
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
     cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
 
-    cv.Canny(blur, edges, CANNY_LOW, CANNY_HIGH);
+    cv.Canny(blur, edges, tuningRef.current.cannyLow, tuningRef.current.cannyHigh);
     cv.adaptiveThreshold(
       blur,
       adaptive,
@@ -450,8 +661,8 @@ function App() {
     cv.findContours(closed, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE);
 
     const frameArea = canvas.width * canvas.height;
-    const minArea = frameArea * CARD_MIN_AREA_FRAC;
-    const maxArea = frameArea * CARD_MAX_AREA_FRAC;
+    const minArea = frameArea * tuningRef.current.cardMinAreaFrac;
+    const maxArea = frameArea * tuningRef.current.cardMaxAreaFrac;
     const candidates = [];
 
     for (let i = 0; i < contours.size(); i += 1) {
@@ -490,14 +701,14 @@ function App() {
       }
 
       const ratio = longSide / shortSide;
-      if (ratio < CARD_RATIO_MIN || ratio > CARD_RATIO_MAX) {
+      if (ratio < tuningRef.current.cardRatioMin || ratio > tuningRef.current.cardRatioMax) {
         cnt.delete();
         continue;
       }
 
       const rotatedArea = rotW * rotH;
       const extent = area / Math.max(rotatedArea, 1);
-      if (extent < CARD_MIN_EXTENT) {
+      if (extent < tuningRef.current.cardMinExtent) {
         cnt.delete();
         continue;
       }
@@ -544,7 +755,7 @@ function App() {
     candidates.sort((a, b) => b.score - a.score);
     const kept = [];
     for (const c of candidates) {
-      const overlaps = kept.some((k) => rectIoU(k, c) > NMS_IOU_THRESHOLD);
+      const overlaps = kept.some((k) => rectIoU(k, c) > tuningRef.current.nmsIou);
       if (!overlaps) kept.push(c);
       if (kept.length >= 6) break;
     }
@@ -591,15 +802,15 @@ function App() {
       }
       if (bestIdx >= 0) {
         const nextHits = (existing[bestIdx].hitCount ?? 0) + 1;
-        const nowStable = existing[bestIdx].stable || nextHits >= MIN_STABLE_HITS;
+        const nowStable = existing[bestIdx].stable || nextHits >= tuningRef.current.minStableHits;
         const smoothedNx =
-          existing[bestIdx].nx * (1 - TRACK_SMOOTHING_ALPHA) + det.nx * TRACK_SMOOTHING_ALPHA;
+          existing[bestIdx].nx * (1 - tuningRef.current.trackSmoothing) + det.nx * tuningRef.current.trackSmoothing;
         const smoothedNy =
-          existing[bestIdx].ny * (1 - TRACK_SMOOTHING_ALPHA) + det.ny * TRACK_SMOOTHING_ALPHA;
+          existing[bestIdx].ny * (1 - tuningRef.current.trackSmoothing) + det.ny * tuningRef.current.trackSmoothing;
         const smoothedNw =
-          existing[bestIdx].nw * (1 - TRACK_SMOOTHING_ALPHA) + det.nw * TRACK_SMOOTHING_ALPHA;
+          existing[bestIdx].nw * (1 - tuningRef.current.trackSmoothing) + det.nw * tuningRef.current.trackSmoothing;
         const smoothedNh =
-          existing[bestIdx].nh * (1 - TRACK_SMOOTHING_ALPHA) + det.nh * TRACK_SMOOTHING_ALPHA;
+          existing[bestIdx].nh * (1 - tuningRef.current.trackSmoothing) + det.nh * tuningRef.current.trackSmoothing;
         existing[bestIdx] = {
           ...existing[bestIdx],
           ...det,
@@ -637,10 +848,16 @@ function App() {
     });
 
     const filtered = aged.filter((t) => {
+      if (t.locked) {
+        return (
+          now - t.lastSeen <= TRACK_TTL_MS * 2 &&
+          (t.missCount ?? 0) <= Math.max(tuningRef.current.maxMissed, 30)
+        );
+      }
       if (STICKY_CONFIRMED_TRACKS && t.sticky) {
         return now - t.lastSeen <= STICKY_MAX_IDLE_MS;
       }
-      return now - t.lastSeen <= TRACK_TTL_MS && (t.missCount ?? 0) <= MAX_MISSED_DETECTIONS;
+      return now - t.lastSeen <= TRACK_TTL_MS && (t.missCount ?? 0) <= tuningRef.current.maxMissed;
     });
     tracksRef.current = filtered;
     const visible = filtered.filter((t) => t.stable || t.locked || t.sticky);
@@ -653,6 +870,7 @@ function App() {
           a.id !== b.id ||
           a.label !== b.label ||
           a.locked !== b.locked ||
+          Math.abs((a.probability ?? 0) - (b.probability ?? 0)) > 0.002 ||
           Math.abs((a.nx ?? 0) - b.nx) > 0.01 ||
           Math.abs((a.ny ?? 0) - b.ny) > 0.01 ||
           Math.abs((a.nw ?? 0) - b.nw) > 0.01 ||
@@ -679,9 +897,25 @@ function App() {
         !opencvReadyRef.current
       )
         return;
+      if (dealerSlotRef.current && playerSlotRef.current) return;
+
       const canvas = drawCurrentFrameToCanvas();
       if (!canvas) return;
-      const rects = detectCardRects(canvas);
+      let rects = detectCardRects(canvas);
+      const centerYN = (r) => r.ny + r.nh / 2;
+      const inHalf = (upper) =>
+        rects
+          .filter((r) => (upper ? centerYN(r) < 0.5 : centerYN(r) >= 0.5))
+          .sort((a, b) => b.nw * b.nh - a.nw * a.nh);
+      if (!dealerSlotRef.current) {
+        const list = inHalf(true);
+        rects = list[0] ? [list[0]] : [];
+      } else if (!playerSlotRef.current) {
+        const list = inHalf(false);
+        rects = list[0] ? [list[0]] : [];
+      } else {
+        rects = [];
+      }
       mergeDetectionsIntoTracks(rects);
     }, DETECT_INTERVAL_MS);
   };
@@ -742,6 +976,31 @@ function App() {
     return dataUrl.split(",")[1] ?? "";
   };
 
+  const cropSlotToBase64 = (canvas, slot) => {
+    if (!canvas || !slot) return "";
+    const cw = canvas.width;
+    const ch = canvas.height;
+    if (slot.cornersNorm?.length === 4) {
+      const corners = slot.cornersNorm.map((p) => ({ x: p.nx * cw, y: p.ny * ch }));
+      return cropRectToBase64(canvas, {
+        corners,
+        nx: slot.nx,
+        ny: slot.ny,
+        nw: slot.nw,
+        nh: slot.nh,
+        x: Math.round(slot.nx * cw),
+        y: Math.round(slot.ny * ch),
+        w: Math.max(1, Math.round(slot.nw * cw)),
+        h: Math.max(1, Math.round(slot.nh * ch)),
+      });
+    }
+    const x = Math.round(slot.nx * cw);
+    const y = Math.round(slot.ny * ch);
+    const w = Math.max(1, Math.round(slot.nw * cw));
+    const h = Math.max(1, Math.round(slot.nh * ch));
+    return cropRectToBase64(canvas, { x, y, w, h, nx: slot.nx, ny: slot.ny, nw: slot.nw, nh: slot.nh });
+  };
+
   const startLiveScan = () => {
     if (!isCameraOn) {
       setError("Start camera first.");
@@ -752,7 +1011,7 @@ function App() {
     }
     setIsLiveScanning(true);
     scanTimerRef.current = setInterval(async () => {
-      // Server pipeline does detect+crop+classify; skip client OpenCV path when it is on.
+      // Fixed slots: no full-frame search — classify only the armed slot after both anchors exist.
       if (
         ENABLE_OPENCV_MULTICARD &&
         !USE_PIPELINE &&
@@ -760,6 +1019,48 @@ function App() {
         multiCardMode &&
         opencvReady
       ) {
+        const canvas = drawCurrentFrameToCanvas();
+        if (!canvas) return;
+
+        if (dealerSlotRef.current && playerSlotRef.current) {
+          const armed = slotArmedRef.current;
+          if (armed && !inFlightRef.current) {
+            const slot = armed === "dealer" ? dealerSlotRef.current : playerSlotRef.current;
+            const imageBase64 = cropSlotToBase64(canvas, slot);
+            if (imageBase64) {
+              const data = await runPrediction(imageBase64, "live", false);
+              const top = data?.predictions?.[0]?.top_prediction;
+              const prob = top?.probability ?? 0;
+              const label = top?.label ?? "";
+              if (armed === "dealer") {
+                setSlotPreview((p) => ({ ...p, dealer: label ? { label, probability: prob } : null }));
+              } else {
+                setSlotPreview((p) => ({ ...p, player: label ? { label, probability: prob } : null }));
+              }
+              if (label && prob >= tuningRef.current.lockThreshold) {
+                const entry = {
+                  id: nextHandCardIdRef.current++,
+                  label,
+                  probability: prob,
+                };
+                const delta = hiLoDelta(label);
+                if (armed === "dealer") {
+                  setCommittedDealer((prev) => [...prev, entry]);
+                } else {
+                  setCommittedPlayer((prev) => [...prev, entry]);
+                }
+                setRunningCount((v) => v + delta);
+                setCardsSeen((v) => v + 1);
+                slotArmedRef.current = null;
+                setSlotArmed(null);
+                setSlotPreview(emptySlotPreview());
+              }
+            }
+          }
+          setResult(null);
+          return;
+        }
+
         const now = Date.now();
         const activeTracks = tracksRef.current.filter(
           (t) =>
@@ -768,8 +1069,6 @@ function App() {
         );
         const unresolved = activeTracks.filter((t) => !t.locked);
         if (unresolved.length > 0) {
-          const canvas = drawCurrentFrameToCanvas();
-          if (!canvas) return;
           const crops = unresolved.map((rect) => cropRectToBase64(canvas, rect));
           const data = await runBatchPrediction(crops);
           if (data?.predictions) {
@@ -781,12 +1080,12 @@ function App() {
               if (!top) return track;
               const probability = top.probability ?? 0;
               const shouldStick =
-                track.sticky || (STICKY_CONFIRMED_TRACKS && (track.stable || probability >= LOCK_THRESHOLD));
+                track.sticky || (STICKY_CONFIRMED_TRACKS && (track.stable || probability >= tuningRef.current.lockThreshold));
               return {
                 ...track,
                 label: top.label ?? track.label,
                 probability,
-                locked: track.locked || probability >= LOCK_THRESHOLD,
+                locked: track.locked || probability >= tuningRef.current.lockThreshold,
                 sticky: shouldStick,
                 endpoint,
               };
@@ -799,6 +1098,8 @@ function App() {
           setResult(null);
           return;
         }
+        setResult(null);
+        return;
       }
 
       const canvas = drawCurrentFrameToCanvas();
@@ -822,6 +1123,9 @@ function App() {
       clearInterval(scanTimerRef.current);
       scanTimerRef.current = null;
     }
+    slotArmedRef.current = null;
+    setSlotArmed(null);
+    setSlotPreview(emptySlotPreview());
     setIsLiveScanning(false);
   };
 
@@ -834,7 +1138,10 @@ function App() {
           <h1>Blackjack Card Classifier</h1>
             <p className="muted">
             Switch between upload and live camera mode. Frames are sent to API Gateway and scored by SageMaker.
-            {USE_PIPELINE && " Multi-card frames use the detect → classify pipeline when VITE_PIPELINE_PATH is set."}
+            {USE_PIPELINE && " Pipeline mode uses detect → classify when VITE_PIPELINE_PATH is set."}
+            {!USE_PIPELINE &&
+              ENABLE_OPENCV_MULTICARD &&
+              " Live OpenCV mode uses one fixed slot per side after the first card is found in each half of the frame."}
             </p>
             <p className="muted small">
               Build-time routes: classifier{" "}
@@ -942,11 +1249,47 @@ function App() {
                   onChange={(e) => {
                     setMultiCardMode(e.target.checked);
                     resetLiveTrackingState();
+                    discoveryAnchoredRef.current = { dealer: false, player: false };
+                    dealerSlotRef.current = null;
+                    playerSlotRef.current = null;
+                    slotArmedRef.current = null;
+                    setDealerSlot(null);
+                    setPlayerSlot(null);
+                    setSlotArmed(null);
+                    setSlotPreview(emptySlotPreview());
                   }}
                 />
-                Detect multiple cards per frame (OpenCV)
+                Dealer / player slots (OpenCV finds the first card each; same spot for later cards)
                 {!ENABLE_OPENCV_MULTICARD && " — off (use server pipeline / YOLO). Enable in code: ENABLE_OPENCV_MULTICARD."}
               </label>
+
+              <label className="label">Decks in shoe</label>
+              <select
+                value={numDecks}
+                onChange={(e) => setNumDecks(Number(e.target.value))}
+              >
+                <option value={1}>1</option>
+                <option value={2}>2</option>
+                <option value={4}>4</option>
+                <option value={6}>6</option>
+                <option value={8}>8</option>
+              </select>
+
+              <label className="label">
+                Cards burned / thrown out at shuffle: {burnedCards}
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={52}
+                step={1}
+                value={burnedCards}
+                onChange={(e) => setBurnedCards(Math.max(0, Number(e.target.value) || 0))}
+              />
+              <p className="muted small">
+                In most casinos the dealer burns 1 card after a shuffle, and sometimes more are discarded. Those cards
+                are not visible but are gone from the shoe.
+              </p>
 
               {!USE_PIPELINE && (
                 <p className="muted small" style={{ marginTop: "0.75rem", maxWidth: "42rem" }}>
@@ -963,6 +1306,195 @@ function App() {
                   Pipeline mode: each frame is sent to <code>/predict-pipeline</code> (detect boxes, then classify each
                   crop).
                 </p>
+              )}
+
+              {ENABLE_OPENCV_MULTICARD && (
+                <details
+                  open={showTuning}
+                  onToggle={(e) => setShowTuning(e.currentTarget.open)}
+                  style={{ marginTop: "0.75rem" }}
+                >
+                  <summary style={{ cursor: "pointer" }}>
+                    <strong>Detector tuning (advanced)</strong>
+                  </summary>
+                  <p className="muted small">
+                    Change one value at a time. Effects are live; no restart needed.
+                  </p>
+
+                  <label className="label">
+                    Lock threshold (classifier confidence): {tuning.lockThreshold.toFixed(2)}
+                  </label>
+                  <input
+                    type="range"
+                    min={0.5}
+                    max={0.99}
+                    step={0.01}
+                    value={tuning.lockThreshold}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, lockThreshold: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    Min card area (% of frame): {(tuning.cardMinAreaFrac * 100).toFixed(2)}%
+                  </label>
+                  <input
+                    type="range"
+                    min={0.0005}
+                    max={0.05}
+                    step={0.0005}
+                    value={tuning.cardMinAreaFrac}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, cardMinAreaFrac: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    Max card area (% of frame): {(tuning.cardMaxAreaFrac * 100).toFixed(0)}%
+                  </label>
+                  <input
+                    type="range"
+                    min={0.1}
+                    max={0.9}
+                    step={0.05}
+                    value={tuning.cardMaxAreaFrac}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, cardMaxAreaFrac: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    Aspect ratio min (height/width): {tuning.cardRatioMin.toFixed(2)}
+                  </label>
+                  <input
+                    type="range"
+                    min={1.0}
+                    max={1.5}
+                    step={0.05}
+                    value={tuning.cardRatioMin}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, cardRatioMin: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    Aspect ratio max (height/width): {tuning.cardRatioMax.toFixed(2)}
+                  </label>
+                  <input
+                    type="range"
+                    min={1.5}
+                    max={3.0}
+                    step={0.05}
+                    value={tuning.cardRatioMax}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, cardRatioMax: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    Min extent (contour fill of its bbox): {tuning.cardMinExtent.toFixed(2)}
+                  </label>
+                  <input
+                    type="range"
+                    min={0.3}
+                    max={0.95}
+                    step={0.01}
+                    value={tuning.cardMinExtent}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, cardMinExtent: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    Canny low threshold: {tuning.cannyLow}
+                  </label>
+                  <input
+                    type="range"
+                    min={5}
+                    max={100}
+                    step={1}
+                    value={tuning.cannyLow}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, cannyLow: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    Canny high threshold: {tuning.cannyHigh}
+                  </label>
+                  <input
+                    type="range"
+                    min={30}
+                    max={250}
+                    step={1}
+                    value={tuning.cannyHigh}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, cannyHigh: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    NMS IoU threshold: {tuning.nmsIou.toFixed(2)}
+                  </label>
+                  <input
+                    type="range"
+                    min={0.1}
+                    max={0.8}
+                    step={0.05}
+                    value={tuning.nmsIou}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, nmsIou: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    Track smoothing alpha: {tuning.trackSmoothing.toFixed(2)}
+                  </label>
+                  <input
+                    type="range"
+                    min={0.1}
+                    max={1.0}
+                    step={0.05}
+                    value={tuning.trackSmoothing}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, trackSmoothing: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    Min stable hits before showing: {tuning.minStableHits}
+                  </label>
+                  <input
+                    type="range"
+                    min={1}
+                    max={8}
+                    step={1}
+                    value={tuning.minStableHits}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, minStableHits: Number(e.target.value) }))
+                    }
+                  />
+
+                  <label className="label">
+                    Max missed detections before drop: {tuning.maxMissed}
+                  </label>
+                  <input
+                    type="range"
+                    min={2}
+                    max={40}
+                    step={1}
+                    value={tuning.maxMissed}
+                    onChange={(e) =>
+                      setTuning((t) => ({ ...t, maxMissed: Number(e.target.value) }))
+                    }
+                  />
+
+                  <div className="buttonRow">
+                    <button type="button" onClick={() => setTuning(DEFAULT_TUNING)}>
+                      Reset tuning to defaults
+                    </button>
+                  </div>
+                </details>
               )}
 
               <div className="buttonRow">
@@ -1009,6 +1541,42 @@ function App() {
                 <div className="tableDivider" />
                 <span className="tableZoneLabel dealer">Dealer</span>
                 <span className="tableZoneLabel player">Player</span>
+                {dealerSlot && (
+                  <div
+                    className="cardBox slotBox"
+                    style={{
+                      left: `${dealerSlot.nx * 100}%`,
+                      top: `${dealerSlot.ny * 100}%`,
+                      width: `${dealerSlot.nw * 100}%`,
+                      height: `${dealerSlot.nh * 100}%`,
+                    }}
+                  >
+                    <span className="cardLabel">
+                      Dealer slot
+                      {slotPreview.dealer?.label
+                        ? ` · ${slotPreview.dealer.label} ${(slotPreview.dealer.probability * 100).toFixed(0)}%`
+                        : ""}
+                    </span>
+                  </div>
+                )}
+                {playerSlot && (
+                  <div
+                    className="cardBox slotBox"
+                    style={{
+                      left: `${playerSlot.nx * 100}%`,
+                      top: `${playerSlot.ny * 100}%`,
+                      width: `${playerSlot.nw * 100}%`,
+                      height: `${playerSlot.nh * 100}%`,
+                    }}
+                  >
+                    <span className="cardLabel">
+                      Player slot
+                      {slotPreview.player?.label
+                        ? ` · ${slotPreview.player.label} ${(slotPreview.player.probability * 100).toFixed(0)}%`
+                        : ""}
+                    </span>
+                  </div>
+                )}
                 {liveCards.map((card) => (
                   <div
                     key={`box-${card.id}`}
@@ -1083,20 +1651,36 @@ function App() {
           </article>
 
           <article className="panel">
-            <h2>Predictions</h2>
+            <h2>Blackjack table</h2>
             {error && <p className="error">{error}</p>}
-            {!error &&
-              !result?.predictions?.[0] &&
-              !pipelineResult &&
-              liveCards.length === 0 && <p className="muted">No prediction yet.</p>}
-            {!error && liveCards.length > 0 && (() => {
-              const dealerCards = [];
-              const playerCards = [];
+
+            {(() => {
+              const dealerCards = committedDealer;
+              const playerCards = committedPlayer;
+              const scanningDealer = [];
+              const scanningPlayer = [];
               for (const card of liveCards) {
                 const centerY = (card.ny ?? 0) + (card.nh ?? 0) / 2;
-                (centerY < 0.5 ? dealerCards : playerCards).push(card);
+                (centerY < 0.5 ? scanningDealer : scanningPlayer).push(card);
               }
-              const renderHand = (title, hand) => {
+              const slotMode =
+                mode === "live" &&
+                ENABLE_OPENCV_MULTICARD &&
+                multiCardMode &&
+                !USE_PIPELINE;
+              const leader = currentRoundLeader(dealerCards, playerCards);
+              const decksRemaining = Math.max(
+                0.25,
+                numDecks - (cardsSeen + burnedCards) / 52
+              );
+              const trueCount = runningCount / decksRemaining;
+              const suggestion = suggestAction({
+                dealer: dealerCards,
+                player: playerCards,
+                trueCount,
+              });
+
+              const renderHand = (title, hand, scanning) => {
                 const summary = handSummary(hand);
                 return (
                   <div className="handBlock" key={title}>
@@ -1113,15 +1697,19 @@ function App() {
                         <span className="muted small"> 21</span>
                       )}
                     </h3>
-                    {hand.length === 0 ? (
-                      <p className="muted small">No cards.</p>
+                    {hand.length === 0 && scanning.length === 0 ? (
+                      <p className="muted small">No cards yet.</p>
                     ) : (
                       <ul>
                         {hand.map((card, idx) => (
-                          <li key={`${card.id}-${card.label || "scan"}`}>
-                            Card {idx + 1}: <strong>{card.label || "Scanning..."}</strong>
-                            {card.label ? ` (${(card.probability * 100).toFixed(0)}%)` : ""}
-                            {card.locked ? " [locked]" : ""}
+                          <li key={`c-${card.id}`}>
+                            Card {idx + 1}: <strong>{card.label}</strong>{" "}
+                            ({(card.probability * 100).toFixed(0)}%)
+                          </li>
+                        ))}
+                        {scanning.map((card) => (
+                          <li key={`s-${card.id}`} className="muted small">
+                            Scanning: {card.label ? `${card.label} (${(card.probability * 100).toFixed(0)}%)` : "…"}
                           </li>
                         ))}
                       </ul>
@@ -1129,13 +1717,145 @@ function App() {
                   </div>
                 );
               };
+
+              const slotPrompt = (() => {
+                if (!slotMode || !isLiveScanning) return null;
+                if (!dealerSlot) {
+                  return "Hold one dealer card in the upper half until it locks (green/yellow box). That fixes the dealer slot.";
+                }
+                if (!playerSlot) {
+                  return "Dealer slot is set. Hold one player card in the lower half until it locks.";
+                }
+                return "Slots are fixed. Put the next card in the correct slot, then tap Scan for that side. Only that crop is sent to the classifier (no OpenCV search).";
+              })();
+
               return (
                 <div>
-                  {renderHand("Dealer's cards", dealerCards)}
-                  {renderHand("Player's cards", playerCards)}
-                  {liveCards[0]?.endpoint && (
+                  {slotPrompt && (
+                    <div className="handBlock">
+                      <h3>Live scan steps</h3>
+                      <p className="muted small">{slotPrompt}</p>
+                      {dealerSlot && playerSlot && (
+                        <div className="buttonRow" style={{ marginTop: "0.5rem" }}>
+                          <button
+                            type="button"
+                            disabled={Boolean(slotArmed)}
+                            onClick={() => {
+                              slotArmedRef.current = "dealer";
+                              setSlotArmed("dealer");
+                              setSlotPreview((p) => ({ ...p, dealer: null }));
+                            }}
+                          >
+                            Scan dealer slot
+                          </button>
+                          <button
+                            type="button"
+                            disabled={Boolean(slotArmed)}
+                            onClick={() => {
+                              slotArmedRef.current = "player";
+                              setSlotArmed("player");
+                              setSlotPreview((p) => ({ ...p, player: null }));
+                            }}
+                          >
+                            Scan player slot
+                          </button>
+                          {slotArmed && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                slotArmedRef.current = null;
+                                setSlotArmed(null);
+                                setSlotPreview(emptySlotPreview());
+                              }}
+                            >
+                              Cancel scan
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {renderHand("Dealer's cards", dealerCards, scanningDealer)}
+                  {renderHand("Player's cards", playerCards, scanningPlayer)}
+
+                  <div className="handBlock">
+                    <h3>Who's ahead</h3>
+                    <p>
+                      {leader === "player" && (
+                        <>
+                          <strong>Player</strong> leads this round.
+                        </>
+                      )}
+                      {leader === "dealer" && (
+                        <>
+                          <strong>Dealer</strong> leads this round.
+                        </>
+                      )}
+                      {leader === "push" && <>Currently a push.</>}
+                      {leader === null && <span className="muted">Waiting for cards.</span>}
+                    </p>
+                  </div>
+
+                  <div className="handBlock">
+                    <h3>Suggested action</h3>
+                    <p>
+                      <strong>{suggestion}</strong>
+                    </p>
                     <p className="muted small">
-                      Endpoint: <code>{liveCards[0].endpoint}</code>
+                      Basic strategy with a few count-based deviations (Hi-Lo). Not financial advice.
+                    </p>
+                  </div>
+
+                  <div className="handBlock">
+                    <h3>Card counting (Hi-Lo)</h3>
+                    <ul>
+                      <li>Running count: <strong>{runningCount}</strong></li>
+                      <li>True count: <strong>{trueCount.toFixed(2)}</strong></li>
+                      <li>Cards seen: {cardsSeen}</li>
+                      <li>Decks remaining: ~{decksRemaining.toFixed(2)} / {numDecks}</li>
+                      <li>Burned / discarded: {burnedCards}</li>
+                    </ul>
+                  </div>
+
+                  <div className="handBlock">
+                    <h3>Rounds</h3>
+                    <p>
+                      Player: <strong>{roundsWon.player}</strong> · Dealer:{" "}
+                      <strong>{roundsWon.dealer}</strong> · Pushes:{" "}
+                      <strong>{roundsWon.push}</strong>
+                    </p>
+                    <div className="buttonRow">
+                      <button type="button" onClick={() => recordRoundWinner("player")}>
+                        Player won
+                      </button>
+                      <button type="button" onClick={() => recordRoundWinner("dealer")}>
+                        Dealer won
+                      </button>
+                      <button type="button" onClick={() => recordRoundWinner("push")}>
+                        Push
+                      </button>
+                    </div>
+                    <p className="muted small">
+                      Recording a round clears the table and dealer/player slots so you can anchor fresh spots. The
+                      running count is unchanged (cards stay out of the shoe).
+                    </p>
+                  </div>
+
+                  <div className="handBlock">
+                    <div className="buttonRow">
+                      <button type="button" onClick={resetAll}>
+                        Reset everything
+                      </button>
+                    </div>
+                    <p className="muted small">
+                      Resets the running count, cards seen, round scores, and current table. Use this when a new shoe
+                      is shuffled in.
+                    </p>
+                  </div>
+
+                  {mode === "live" && result?.endpoint && (
+                    <p className="muted small">
+                      Endpoint: <code>{result.endpoint}</code>
                     </p>
                   )}
                 </div>
