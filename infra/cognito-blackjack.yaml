@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cognito User Pool + public app client for the Blackjack web UI (email sign-up / sign-in).
+  After deploy: set GitHub secrets VITE_COGNITO_REGION, VITE_COGNITO_USER_POOL_ID, VITE_COGNITO_CLIENT_ID
+  from stack Outputs (region is where you deployed this stack).
+
+Parameters:
+  UserPoolName:
+    Type: String
+    Description: Friendly name for the user pool
+    Default: blackjack-users
+  ClientName:
+    Type: String
+    Description: App client name (no secret — for SPA / Vite)
+    Default: blackjack-web
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Ref UserPoolName
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Ref ClientName
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      PreventUserExistenceErrors: ENABLED
+      ReadAttributes:
+        - email
+      WriteAttributes:
+        - email
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+Outputs:
+  UserPoolId:
+    Description: Value for GitHub secret VITE_COGNITO_USER_POOL_ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Value for GitHub secret VITE_COGNITO_CLIENT_ID
+    Value: !Ref UserPoolClient
+  Region:
+    Description: Value for GitHub secret VITE_COGNITO_REGION (same as stack region)
+    Value: !Ref AWS::Region

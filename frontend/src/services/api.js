@@ -1,4 +1,5 @@
 import axios from "axios";
+import { getAuthIdToken } from "./authToken";
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:3000";
 const predictPath = import.meta.env.VITE_PREDICT_PATH ?? "/predict";
@@ -9,6 +10,14 @@ const api = axios.create({
   headers: {
     "Content-Type": "application/json",
   },
+});
+
+api.interceptors.request.use((config) => {
+  const token = getAuthIdToken();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
 });
 
 export async function predictCard({ imageBase64, topK = 3 }) {

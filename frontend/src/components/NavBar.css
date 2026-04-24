@@ -17,6 +17,13 @@
   letter-spacing: 0.4px;
 }
 
+.nav-right {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  position: relative;
+}
+
 .nav-pill {
   background: #1f3d86;
   border: 1px solid #4d84ff;

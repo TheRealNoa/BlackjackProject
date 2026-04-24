@@ -1,0 +1,146 @@
+.authBar {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  position: relative;
+}
+
+.authBarSignedIn {
+  gap: 10px;
+}
+
+.authEmail {
+  color: #c8daf8;
+  font-size: 0.82rem;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.authMuted {
+  color: #8aa4cc;
+  font-size: 0.82rem;
+}
+
+.authPanel {
+  background: rgba(10, 18, 40, 0.98);
+  border: 1px solid rgba(88, 139, 255, 0.35);
+  border-radius: 12px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+  min-width: 280px;
+  padding: 12px 14px 14px;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 50;
+}
+
+.authPanelHeader {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.authPanelTitle {
+  color: #e7edf7;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.authClose {
+  background: transparent;
+  border: none;
+  color: #9ab6e0;
+  cursor: pointer;
+  font-size: 1.25rem;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.authClose:hover {
+  color: #e7edf7;
+}
+
+.authForm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.authLabel {
+  color: #b8cce8;
+  display: flex;
+  flex-direction: column;
+  font-size: 0.78rem;
+  font-weight: 600;
+  gap: 4px;
+}
+
+.authInput {
+  background: rgba(6, 12, 28, 0.9);
+  border: 1px solid rgba(88, 139, 255, 0.28);
+  border-radius: 8px;
+  color: #e7edf7;
+  font-size: 0.9rem;
+  padding: 8px 10px;
+}
+
+.authInput:focus {
+  border-color: rgba(120, 170, 255, 0.55);
+  outline: none;
+}
+
+.authHint {
+  color: #a7b8d8;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  margin: 0;
+}
+
+.authError {
+  color: #ff9a9a;
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+.authActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.authBtn {
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 7px 12px;
+}
+
+.authBtn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.authBtnPrimary {
+  background: #2a52c4;
+  border: 1px solid #5c8dff;
+  color: #f0f5ff;
+}
+
+.authBtnPrimary:hover:not(:disabled) {
+  background: #345fd9;
+}
+
+.authBtnGhost {
+  background: transparent;
+  border: 1px solid rgba(120, 170, 255, 0.35);
+  color: #c8daf8;
+}
+
+.authBtnGhost:hover:not(:disabled) {
+  border-color: rgba(160, 195, 255, 0.55);
+}

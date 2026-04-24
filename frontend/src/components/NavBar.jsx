@@ -1,3 +1,4 @@
+import AuthBar from "./AuthBar";
 import "./NavBar.css";
 
 function NavBar() {
@@ -8,6 +9,7 @@ function NavBar() {
       </div>
       <div className="nav-right">
         <span className="nav-pill">Card Classifier</span>
+        <AuthBar />
       </div>
     </header>
   );
